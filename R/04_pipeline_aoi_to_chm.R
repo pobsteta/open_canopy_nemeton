@@ -334,6 +334,23 @@ download_model <- function(model_name = "unet") {
   library(reticulate)
   hf_hub <- import("huggingface_hub")
 
+  # Vérifier que le token HuggingFace est configuré (dataset gated)
+  token <- Sys.getenv("HF_TOKEN", unset = "")
+  if (token == "") {
+    # Vérifier si huggingface-cli login a été fait
+    tryCatch({
+      stored <- hf_hub$HfFolder$get_token()
+      if (is.null(stored) || stored == "") stop("no token")
+    }, error = function(e) {
+      message("ATTENTION: Aucun token HuggingFace détecté.")
+      message("Le dataset AI4Forest/Open-Canopy est en accès restreint.")
+      message("Connectez-vous d'abord avec l'une de ces méthodes :")
+      message("  1. Dans R:     Sys.setenv(HF_TOKEN = 'hf_votre_token')")
+      message("  2. En terminal: huggingface-cli login")
+      message("  3. Créez un token sur: https://huggingface.co/settings/tokens")
+    })
+  }
+
   message("Recherche des checkpoints dans le dataset HuggingFace...")
 
   # Lister dynamiquement les fichiers .ckpt dans pretrained_models/
@@ -346,9 +363,13 @@ download_model <- function(model_name = "unet") {
     )
 
     # Extraire les noms de fichiers .ckpt
+    # Convertir le générateur Python en liste R
+    items <- tryCatch(
+      reticulate::iterate(tree),
+      error = function(e) as.list(tree)
+    )
     ckpt_files <- character(0)
-    iter <- iterate(tree)
-    while (!is.null(item <- iter_next(iter))) {
+    for (item in items) {
       fname <- item$rfilename
       if (!is.null(fname) && grepl("\\.ckpt$", fname)) {
         ckpt_files <- c(ckpt_files, fname)
