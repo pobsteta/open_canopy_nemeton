@@ -115,22 +115,33 @@ download_wms_tile <- function(bbox, layer, res_m = RES_IGN, dest_file) {
   )
 
   tryCatch({
-    curl_download(url = wms_url, destfile = dest_file, quiet = TRUE)
+    # Télécharger dans un fichier temporaire
+    tmp_file <- tempfile(fileext = ".tif")
+    curl_download(url = wms_url, destfile = tmp_file, quiet = TRUE)
 
     # Vérifier que c'est bien un raster (pas un XML d'erreur)
-    r <- rast(dest_file)
+    r <- rast(tmp_file)
 
     # Assigner le CRS et l'emprise si nécessaire
+    needs_fix <- FALSE
     if (is.na(crs(r)) || crs(r) == "") {
       crs(r) <- "EPSG:2154"
+      needs_fix <- TRUE
     }
 
     # Forcer l'emprise correcte
     ext(r) <- ext(xmin, xmax, ymin, ymax)
 
+    # Écrire le fichier final (depuis le temp, pas de conflit)
     writeRaster(r, dest_file, overwrite = TRUE)
+
+    # Libérer la source temp et nettoyer
+    r <- rast(dest_file)
+    unlink(tmp_file)
+
     return(r)
   }, error = function(e) {
+    unlink(tmp_file)
     warning("Échec WMS: ", e$message)
     return(NULL)
   })
