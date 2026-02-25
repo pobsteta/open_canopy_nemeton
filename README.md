@@ -1,23 +1,34 @@
-# Open-Canopy R
+# Open-Canopy R — Ortho IGN 0.20m + SPOT 1.5m
 
-Code R pour télécharger, analyser et visualiser le dataset **[Open-Canopy](https://huggingface.co/datasets/AI4Forest/Open-Canopy)** depuis Hugging Face.
+Code R pour estimer la hauteur de canopée à partir des **ortho IGN** (RVB + IRC à 0.20m) en exploitant les modèles pré-entraînés **[Open-Canopy](https://huggingface.co/datasets/AI4Forest/Open-Canopy)** (SPOT 6-7 à 1.5m).
 
-## Description
+## Contexte
 
-[Open-Canopy](https://arxiv.org/abs/2407.09392) est un benchmark ouvert à l'échelle nationale pour l'estimation de la hauteur de canopée à très haute résolution (1.5 m). Le dataset couvre plus de 87 000 km² en France et combine :
+Le projet **Open-Canopy** fournit des modèles (UNet, PVTv2) entraînés sur images SPOT 6-7 à 1.5m pour prédire la hauteur de canopée. Ce dépôt adapte ces modèles pour fonctionner avec les **orthophotos IGN** (BD ORTHO®) à **0.20m**, qui offrent une résolution 7.5x supérieure.
 
-- **Images SPOT 6-7** : imagerie satellite multispectrale à 1.5 m de résolution
-- **CHM LiDAR** : modèles de hauteur de canopée dérivés de données LiDAR aériennes haute résolution
-- **Benchmark de changement** : détection des changements de hauteur de canopée entre deux dates
+### Comparaison des données sources
+
+| | Open-Canopy (SPOT) | Ortho IGN |
+|---|---|---|
+| **Résolution** | 1.5 m/pixel | 0.20 m/pixel |
+| **Pixels/km²** | 444 444 | 25 000 000 |
+| **Source** | Satellite SPOT 6-7 | Photo aérienne IGN |
+| **Bandes RVB** | R, V, B (+ PIR) | R, V, B |
+| **Bandes IRC** | — | PIR, R, V |
+| **Format** | GeoTIFF | JPEG2000 (.jp2) |
+| **NDVI** | Non | Oui (depuis IRC) |
+| **Couverture** | 87 000 km² (France) | France entière |
 
 ## Structure du projet
 
 ```
 ├── R/
-│   ├── 01_download_open_canopy.R   # Téléchargement depuis Hugging Face
-│   ├── 02_analyse_open_canopy.R    # Analyse et visualisation
-│   └── 03_prediction_open_canopy.R # Prédiction et post-traitement
-├── data/                           # Données téléchargées (non versionné)
+│   ├── 01_download_open_canopy.R   # Téléchargement HF + chargement IGN
+│   ├── 02_analyse_open_canopy.R    # Analyse, NDVI, visualisation
+│   └── 03_prediction_open_canopy.R # Inférence modèles + post-traitement
+├── data/
+│   ├── open_canopy/                # Dataset HF (SPOT 1.5m)
+│   └── ign/                        # Ortho IGN (RVB + IRC, 0.20m)
 ├── outputs/                        # Résultats et graphiques
 ├── .gitignore
 └── README.md
@@ -25,91 +36,134 @@ Code R pour télécharger, analyser et visualiser le dataset **[Open-Canopy](htt
 
 ## Prérequis
 
-### Packages R requis
+### Packages R
 
 ```r
 install.packages(c("terra", "sf", "httr2", "jsonlite", "curl", "fs"))
-
-# Optionnel (pour les modèles pré-entraînés via Python)
-install.packages("reticulate")
+install.packages("reticulate")  # Interface Python
 ```
 
-### Token Hugging Face (optionnel)
+### Environnement Python (miniforge + conda)
 
-Pour les datasets publics, aucun token n'est nécessaire. Si vous avez besoin d'un accès authentifié :
+L'environnement conda `open_canopy` doit être installé avec PyTorch :
 
 ```bash
-export HF_TOKEN="hf_votre_token_ici"
+# Installer miniforge si nécessaire
+# https://github.com/conda-forge/miniforge
+
+conda create -n open_canopy python=3.10
+conda activate open_canopy
+pip install torch torchvision numpy rasterio huggingface_hub
+```
+
+### Connexion R → Python
+
+```r
+library(reticulate)
+use_condaenv("open_canopy", required = TRUE)
 ```
 
 ## Utilisation
 
-### 1. Télécharger les données
+### 1. Charger les données
 
 ```r
 source("R/01_download_open_canopy.R")
 
-# Télécharger un sous-ensemble de tuiles de test
+# --- Ortho IGN (placer les .jp2 dans data/ign/) ---
+irc <- load_ign_ortho("data/ign/ortho_irc.jp2", type = "irc")
+rvb <- load_ign_ortho("data/ign/ortho_rvb.jp2", type = "rvb")
+
+# Télécharger via WMS IGN pour une emprise donnée (Lambert-93)
+bbox <- c(843000, 6518000, 844000, 6519000)
+download_ign_ortho_pair(bbox)
+
+# --- Open-Canopy (SPOT, Hugging Face) ---
 download_open_canopy_subset(split = "test", n_tiles = 5)
-
-# Télécharger des tuiles d'entraînement
-download_open_canopy_subset(split = "train", n_tiles = 100, data_type = "all")
-
-# Cloner le dataset complet (~360 Go, nécessite git-lfs)
-hf_git_clone()
 ```
 
-### 2. Analyser et visualiser
+### 2. Analyser (NDVI, classification, croisement)
 
 ```r
 source("R/02_analyse_open_canopy.R")
 
-# Charger une image SPOT
-spot <- load_spot_image("data/test/images/tile_001.tif")
-plot_spot_rgb(spot)
+# Charger l'IRC et calculer le NDVI
+irc <- load_ign_ortho("data/ign/ortho_irc.jp2", type = "irc")
+ndvi <- compute_ndvi(irc)        # (PIR - R) / (PIR + R)
+gndvi <- compute_gndvi(irc)      # (PIR - V) / (PIR + V)
+savi <- compute_savi(irc)        # SAVI (ajusté sol)
 
-# Charger et analyser un CHM
-chm <- load_chm("data/test/lidar/tile_001.tif")
-stats <- compute_chm_stats(chm)
-plot_chm(chm)
-plot_canopy_classes(chm)
+# Masque de végétation
+veg <- mask_vegetation(ndvi, threshold = 0.3)
 
-# Comparer image et CHM
-plot_spot_chm_comparison(spot, chm, tile_name = "Tuile 001")
+# Visualisation multi-panneaux
+plot_ign_full_comparison(rvb, irc, chm)
+
+# Croisement NDVI x CHM
+cross <- cross_ndvi_chm(ndvi, chm)
+
+# Statistiques
+irc_stats <- compute_irc_stats(irc)
+chm_stats <- compute_chm_stats(chm)
 ```
 
-### 3. Évaluer les prédictions
+### 3. Prédire la hauteur de canopée
 
 ```r
 source("R/03_prediction_open_canopy.R")
 
-# Évaluer des prédictions par rapport à la référence LiDAR
-prediction <- load_predictions("outputs/prediction.tif")
-reference <- load_chm("data/test/lidar/tile_001.tif")
-metrics <- evaluate_predictions(prediction, reference)
+# Configurer l'environnement Python
+setup_conda_env("open_canopy")
 
-# Couverture forestière
-forest_cover <- compute_forest_cover_grid(chm, cell_size = 100)
+# Télécharger un modèle pré-entraîné
+model_path <- download_pretrained_model("unet")
 
-# Détection de perte de canopée
-loss <- detect_canopy_loss(chm_t1, chm_t2, threshold = -5)
+# Pipeline complet : IGN 0.20m → agrégation 1.5m → inférence → CHM
+predict_chm_from_ign("data/ign/ortho_rvb.jp2", model_path)
+
+# Rééchantillonner manuellement
+ign <- load_ign_ortho("data/ign/ortho_rvb.jp2", type = "rvb")
+ign_1_5m <- resample_ign_to_spot(ign)  # 0.20m → 1.5m (facteur 8x)
+
+# Suréchantillonner un CHM prédit vers la résolution IGN
+chm_hr <- upsample_chm_to_ign(chm_predicted)  # 1.5m → 0.20m
 ```
 
-## Dataset Open-Canopy
+## Workflow de rééchantillonnage
 
-| Caractéristique | Valeur |
-|---|---|
-| Couverture | 87 000+ km² (France) |
-| Résolution | 1.5 m |
-| Taille | ~360 Go |
-| Train | 66 339 km² |
-| Validation | 7 369 km² |
-| Test | 13 675 km² |
-| Buffer | 1 km entre test et train/val |
+```
+Ortho IGN (0.20m)                    Modèles Open-Canopy
+5000 x 5000 px/km²                   entraînés sur SPOT 1.5m
+        │                                     │
+        ▼                                     │
+  aggregate(fact=8)                            │
+  moyenne 8x8 pixels                           │
+        │                                     │
+        ▼                                     ▼
+  Image à 1.5m  ──────────────────►  Inférence UNet/PVTv2
+  667 x 667 px/km²                            │
+                                              ▼
+                                    CHM prédit à 1.5m
+                                              │
+                                              ▼
+                                    disagg(fact=8)    (optionnel)
+                                              │
+                                              ▼
+                                    CHM à 0.20m
+```
+
+## Indices spectraux (depuis IRC IGN)
+
+| Indice | Formule | Usage |
+|---|---|---|
+| NDVI | (PIR - R) / (PIR + R) | Activité végétale |
+| GNDVI | (PIR - V) / (PIR + V) | Teneur en chlorophylle |
+| SAVI | ((PIR - R) / (PIR + R + L)) × (1+L) | Végétation sur sol nu |
 
 ## Références
 
-- **Paper** : Fogel et al. (2024). "Open-Canopy: Towards Very High Resolution Forest Monitoring." [arXiv:2407.09392](https://arxiv.org/abs/2407.09392)
-- **Dataset** : [AI4Forest/Open-Canopy sur Hugging Face](https://huggingface.co/datasets/AI4Forest/Open-Canopy)
-- **Code Python** : [fajwel/Open-Canopy sur GitHub](https://github.com/fajwel/Open-Canopy)
-- **Projet** : AI4Forest, financé par l'ANR, le DLR et le BMBF
+- **Open-Canopy** : Fogel et al. (2024). [arXiv:2407.09392](https://arxiv.org/abs/2407.09392)
+- **Dataset HF** : [AI4Forest/Open-Canopy](https://huggingface.co/datasets/AI4Forest/Open-Canopy)
+- **Code Python** : [fajwel/Open-Canopy](https://github.com/fajwel/Open-Canopy)
+- **BD ORTHO® IGN** : [geoservices.ign.fr/bdortho](https://geoservices.ign.fr/bdortho)
+- **Géoplateforme** : [data.geopf.fr](https://data.geopf.fr)

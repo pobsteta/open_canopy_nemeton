@@ -2,9 +2,15 @@
 data/
 *.tif
 *.tiff
+*.jp2
 
 # Sorties
 outputs/
+
+# Python / conda
+__pycache__/
+*.pyc
+*.ckpt
 
 # R
 .Rhistory
