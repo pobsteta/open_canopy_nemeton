@@ -36,6 +36,32 @@ IGN_WMS_URL      <- "https://data.geopf.fr/wms-r"
 IGN_LAYER_ORTHO  <- "ORTHOIMAGERY.ORTHOPHOTOS"
 IGN_LAYER_IRC    <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC"
 
+# --- Millésime (NULL = couche la plus récente disponible) ---
+# Exemples : "2024", "2023", "2021"...
+# Ortho RVB → couche ORTHOIMAGERY.ORTHOPHOTOS.BDORTHO.{année}
+# IRC       → couche ORTHOIMAGERY.ORTHOPHOTOS.IRC-EXPRESS.{année}
+MILLESIME_ORTHO <- NULL
+MILLESIME_IRC   <- NULL
+
+#' Construire le nom de couche WMS en fonction du millésime
+#'
+#' @param type "ortho" ou "irc"
+#' @param millesime Année (chaîne ou numérique), NULL pour la couche courante
+#' @return Nom de couche WMS IGN
+ign_layer_name <- function(type = c("ortho", "irc"), millesime = NULL) {
+  type <- match.arg(type)
+  if (is.null(millesime)) {
+    if (type == "ortho") return(IGN_LAYER_ORTHO)
+    else                 return(IGN_LAYER_IRC)
+  }
+  millesime <- as.character(millesime)
+  if (type == "ortho") {
+    return(paste0("ORTHOIMAGERY.ORTHOPHOTOS.BDORTHO.", millesime))
+  } else {
+    return(paste0("ORTHOIMAGERY.ORTHOPHOTOS.IRC-EXPRESS.", millesime))
+  }
+}
+
 # --- Résolutions ---
 RES_IGN  <- 0.2   # BD ORTHO® IGN
 RES_SPOT <- 1.5   # Modèles Open-Canopy (SPOT 6-7)
@@ -228,27 +254,40 @@ download_ign_tiled <- function(bbox, layer, res_m = RES_IGN,
 #' @param aoi sf object (AOI en Lambert-93)
 #' @param output_dir Répertoire de sortie
 #' @param res_m Résolution en mètres
-#' @return Liste avec rvb (SpatRaster) et irc (SpatRaster)
-download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN) {
+#' @param millesime_ortho Millésime ortho RVB (NULL = plus récent)
+#' @param millesime_irc Millésime IRC (NULL = plus récent)
+#' @return Liste avec rvb, irc (SpatRaster) et millésimes utilisés
+download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN,
+                                    millesime_ortho = MILLESIME_ORTHO,
+                                    millesime_irc = MILLESIME_IRC) {
   dir_create(output_dir)
 
   bbox <- as.numeric(st_bbox(st_union(aoi)))
+
+  # Résoudre les couches WMS selon le millésime
+  layer_ortho <- ign_layer_name("ortho", millesime_ortho)
+  layer_irc   <- ign_layer_name("irc",   millesime_irc)
+  label_ortho <- if (is.null(millesime_ortho)) "plus récent" else millesime_ortho
+  label_irc   <- if (is.null(millesime_irc))   "plus récent" else millesime_irc
+
   message(sprintf("\n=== Téléchargement ortho IGN pour l'AOI ==="))
   message(sprintf("Emprise: %.0f, %.0f - %.0f, %.0f (Lambert-93)",
                    bbox[1], bbox[2], bbox[3], bbox[4]))
   message(sprintf("Taille: %.0f x %.0f m (%.2f ha)",
                    bbox[3] - bbox[1], bbox[4] - bbox[2],
                    (bbox[3] - bbox[1]) * (bbox[4] - bbox[2]) / 10000))
+  message(sprintf("Millésime RVB: %s (couche: %s)", label_ortho, layer_ortho))
+  message(sprintf("Millésime IRC: %s (couche: %s)", label_irc, layer_irc))
 
   # --- RVB ---
   message("\n--- Ortho RVB ---")
-  rvb <- download_ign_tiled(bbox, layer = IGN_LAYER_ORTHO, res_m = res_m,
+  rvb <- download_ign_tiled(bbox, layer = layer_ortho, res_m = res_m,
                              output_dir = output_dir, prefix = "rvb")
   names(rvb)[1:min(3, nlyr(rvb))] <- c("Rouge", "Vert", "Bleu")[1:min(3, nlyr(rvb))]
 
   # --- IRC ---
   message("\n--- Ortho IRC ---")
-  irc <- download_ign_tiled(bbox, layer = IGN_LAYER_IRC, res_m = res_m,
+  irc <- download_ign_tiled(bbox, layer = layer_irc, res_m = res_m,
                              output_dir = output_dir, prefix = "irc")
   names(irc)[1:min(3, nlyr(irc))] <- c("PIR", "Rouge", "Vert")[1:min(3, nlyr(irc))]
 
@@ -271,7 +310,11 @@ download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN) {
   if (length(tile_files) > 0) file_delete(tile_files)
 
   return(list(rvb = rvb, irc = irc,
-              rvb_path = rvb_path, irc_path = irc_path))
+              rvb_path = rvb_path, irc_path = irc_path,
+              millesime_ortho = millesime_ortho,
+              millesime_irc = millesime_irc,
+              layer_ortho = layer_ortho,
+              layer_irc = layer_irc))
 }
 
 # ==============================================================================
@@ -833,13 +876,17 @@ run_inference <- function(rvb, irc, model_path, model_name = "unet",
 #' @param open_canopy_src Chemin vers le code source Open-Canopy (nécessaire
 #'   pour PVTv2, auto-détecté sinon)
 #' @param res_m Résolution de téléchargement IGN (0.2m par défaut)
+#' @param millesime_ortho Millésime ortho RVB (NULL = plus récent)
+#' @param millesime_irc Millésime IRC (NULL = plus récent)
 #' @return Liste avec tous les résultats
 pipeline_aoi_to_chm <- function(aoi_path,
                                   output_dir = file.path(getwd(), "outputs"),
                                   model_name = "unet",
                                   model_path = NULL,
                                   open_canopy_src = NULL,
-                                  res_m = RES_IGN) {
+                                  res_m = RES_IGN,
+                                  millesime_ortho = MILLESIME_ORTHO,
+                                  millesime_irc = MILLESIME_IRC) {
   dir_create(output_dir)
   t0 <- Sys.time()
 
@@ -853,7 +900,9 @@ pipeline_aoi_to_chm <- function(aoi_path,
 
   # --- Étape 2 : Télécharger les ortho IGN ---
   message("\n>>> ÉTAPE 2/5 : Téléchargement des ortho IGN (RVB + IRC)")
-  ortho <- download_ortho_for_aoi(aoi, output_dir = output_dir, res_m = res_m)
+  ortho <- download_ortho_for_aoi(aoi, output_dir = output_dir, res_m = res_m,
+                                   millesime_ortho = millesime_ortho,
+                                   millesime_irc = millesime_irc)
 
   # --- Étape 3 : Configurer Python ---
   message("\n>>> ÉTAPE 3/5 : Configuration Python + téléchargement modèle")
@@ -935,12 +984,14 @@ pipeline_aoi_to_chm <- function(aoi_path,
   par(mfrow = c(2, 2), mar = c(2, 2, 3, 4))
 
   # RVB
+  label_ortho <- if (is.null(ortho$millesime_ortho)) "plus récent" else ortho$millesime_ortho
+  label_irc   <- if (is.null(ortho$millesime_irc))   "plus récent" else ortho$millesime_irc
   plotRGB(ortho$rvb, r = 1, g = 2, b = 3, stretch = "lin",
-          main = "Ortho RVB IGN (0.20m)")
+          main = sprintf("Ortho RVB IGN 0.20m (millésime: %s)", label_ortho))
 
   # IRC fausses couleurs
   plotRGB(ortho$irc, r = 1, g = 2, b = 3, stretch = "lin",
-          main = "Ortho IRC fausses couleurs (0.20m)")
+          main = sprintf("Ortho IRC fausses couleurs 0.20m (millésime: %s)", label_irc))
 
   # NDVI
   col_ndvi <- colorRampPalette(
@@ -976,6 +1027,10 @@ pipeline_aoi_to_chm <- function(aoi_path,
     aoi       = aoi,
     ortho_rvb = ortho$rvb,
     ortho_irc = ortho$irc,
+    millesime_ortho = ortho$millesime_ortho,
+    millesime_irc   = ortho$millesime_irc,
+    layer_ortho     = ortho$layer_ortho,
+    layer_irc       = ortho$layer_irc,
     ndvi      = ndvi,
     chm_1_5m  = chm,
     chm_0_2m  = chm_hr,
