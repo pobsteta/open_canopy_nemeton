@@ -651,8 +651,8 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
         print(f"  Chemin fourni: {oc_src!r}")
         print("  Utilisez le paramètre open_canopy_src dans pipeline_aoi_to_chm()")
         print("  Exemple:")
-        print("    pipeline_aoi_to_chm('aoi.gpkg', model_name='pvtv2',")
-        print("      open_canopy_src='C:/Users/.../Open-Canopy')")
+        print("    pipeline_aoi_to_chm(\"aoi.gpkg\", model_name=\"pvtv2\",")
+        print("      open_canopy_src=\"C:/Users/.../Open-Canopy\")")
 
 # ======================================================================
 # Inférence
