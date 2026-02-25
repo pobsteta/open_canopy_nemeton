@@ -44,6 +44,8 @@ RES_SPOT <- 1.5   # Modèles Open-Canopy (SPOT 6-7)
 HF_REPO_ID <- "AI4Forest/Open-Canopy"
 CONDA_ENV  <- "open_canopy"
 N_INPUT_CHANNELS <- 4  # R, G, B, NIR (ordre SPOT 6-7)
+# Chemin vers le code source Open-Canopy (nécessaire pour PVTv2)
+OPEN_CANOPY_SRC <- NULL  # Sera détecté automatiquement ou passé en paramètre
 
 # --- Limites WMS ---
 WMS_MAX_PX <- 4096  # Taille max par requête WMS
@@ -304,7 +306,7 @@ setup_python <- function() {
 
   # Vérifier les modules nécessaires
   modules <- c("torch", "numpy", "rasterio", "huggingface_hub",
-               "segmentation_models_pytorch")
+               "segmentation_models_pytorch", "timm")
   ok <- TRUE
   for (mod in modules) {
     avail <- py_module_available(mod)
@@ -316,7 +318,7 @@ setup_python <- function() {
     stop("Modules Python manquants. Installez-les dans l'env '", CONDA_ENV, "':\n",
          "  conda activate ", CONDA_ENV, "\n",
          "  pip install torch torchvision numpy rasterio huggingface_hub ",
-         "segmentation-models-pytorch")
+         "segmentation-models-pytorch timm")
   }
 }
 
@@ -433,11 +435,17 @@ make_inference_tiles <- function(r, tile_size = 1000, overlap = 50) {
 
 #' Exécuter l'inférence sur une tuile
 #'
+#' Supporte les deux architectures Open-Canopy :
+#' - UNet (SMP, ResNet34) : reconstruction directe via segmentation_models_pytorch
+#' - PVTv2 (timm, pvt_v2_b3) : nécessite le code source Open-Canopy
+#'
 #' @param tile SpatRaster (4 bandes : R, G, B, PIR à 1.5m)
 #' @param model_path Chemin du modèle .ckpt (PyTorch Lightning)
 #' @param model_name "unet" ou "pvtv2" pour la reconstruction
+#' @param open_canopy_src Chemin vers le code source Open-Canopy (pour PVTv2)
 #' @return SpatRaster CHM prédit (1 bande, en mètres)
-predict_tile <- function(tile, model_path, model_name = "unet") {
+predict_tile <- function(tile, model_path, model_name = "unet",
+                          open_canopy_src = NULL) {
   library(reticulate)
 
   # Sauvegarder la tuile en fichier temporaire
@@ -450,6 +458,12 @@ predict_tile <- function(tile, model_path, model_name = "unet") {
   tmp_out_py <- gsub("\\\\", "/", tmp_out)
   model_path_py <- gsub("\\\\", "/", model_path)
 
+  # Chemin Open-Canopy source (pour PVTv2)
+  oc_src_py <- ""
+  if (!is.null(open_canopy_src)) {
+    oc_src_py <- gsub("\\\\", "/", open_canopy_src)
+  }
+
   py_code <- sprintf('
 import sys
 import os
@@ -457,7 +471,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 import rasterio
-import segmentation_models_pytorch as smp
 
 # ======================================================================
 # Charger l image 4 bandes (R, G, B, PIR)
@@ -466,11 +479,10 @@ with rasterio.open("%s") as src:
     image = src.read().astype(np.float32)  # (C, H, W)
     profile = src.profile.copy()
 
-num_bands = image.shape[0]
-print(f"Image chargée: {num_bands} bandes, shape={image.shape}")
+num_bands, H, W = image.shape
+print(f"Image chargée: {num_bands} bandes, {H}x{W} px")
 
 # Open-Canopy utilise mean=0, std=1 : pas de normalisation
-# Les valeurs brutes sont utilisées directement
 tensor = torch.from_numpy(image).unsqueeze(0)  # (1, C, H, W)
 print(f"Tensor: shape={tuple(tensor.shape)}, "
       f"min={tensor.min():.1f}, max={tensor.max():.1f}")
@@ -489,7 +501,7 @@ print(f"State dict: {len(keys)} paramètres")
 print(f"  Premières clés: {keys[:5]}")
 
 # ======================================================================
-# Fonction set_first_layer (identique au code Open-Canopy)
+# Fonction set_first_layer (reproduction du code Open-Canopy)
 # Adapte la première couche conv de 3 → N canaux
 # ======================================================================
 def set_first_layer(model, n_channels):
@@ -498,31 +510,65 @@ def set_first_layer(model, n_channels):
     for module in model.modules():
         if isinstance(module, nn.Conv2d) and module.in_channels == 3:
             break
+        if isinstance(module, nn.Linear):
+            break
     previous_weight = module.weight.detach()
-    n_out = previous_weight.shape[0]
-    new_weight = torch.randn(
-        n_out, n_channels,
-        previous_weight.shape[2], previous_weight.shape[3]
-    )
-    # Copier les poids RGB dans les 3 premiers canaux
-    new_weight[:, :3] = previous_weight
+    if previous_weight.dim() == 4:
+        # Conv2d
+        n_out = previous_weight.shape[0]
+        new_weight = torch.randn(
+            n_out, n_channels,
+            previous_weight.shape[2], previous_weight.shape[3]
+        )
+        new_weight[:, :3] = previous_weight
+    elif previous_weight.dim() == 2:
+        # Linear (ViT-style patch embedding)
+        n_out = previous_weight.shape[0]
+        n_elem = previous_weight.shape[1] // 3
+        new_weight = torch.randn((n_out, n_channels * n_elem))
+        new_weight[:, :3 * n_elem] = previous_weight
     module.weight = nn.parameter.Parameter(new_weight)
-    module.in_channels = n_channels
+    if hasattr(module, "in_channels"):
+        module.in_channels = n_channels
+
+# ======================================================================
+# Nettoyage des clés du state_dict
+# ======================================================================
+def clean_state_dict(state_dict, prefix_to_strip):
+    """Enlève un préfixe des clés du state_dict."""
+    clean = {}
+    for k, v in state_dict.items():
+        new_k = k
+        for prefix in prefix_to_strip:
+            if new_k.startswith(prefix):
+                new_k = new_k[len(prefix):]
+                break
+        clean[new_k] = v
+    return clean
 
 # ======================================================================
 # Reconstruire le modèle selon l architecture
 # ======================================================================
 model_name = "%s"
+oc_src = "%s"
 model = None
 
-# Détecter si c est un UNet SMP ou un modèle timm
+# Détecter le type de modèle depuis les clés du checkpoint
 has_seg_model = any("seg_model" in k for k in keys)
-has_timm_model = any("model.model" in k or "net.model" in k for k in keys)
+has_timm_model = any("net.model." in k for k in keys)
+has_seg_head = any("net.seg_head." in k for k in keys)
 
-if has_seg_model or model_name == "unet":
-    print("Reconstruction: SMP UNet (ResNet34, 4 canaux, 1 classe)")
+print(f"Détection: seg_model={has_seg_model}, timm_model={has_timm_model}, "
+      f"seg_head={has_seg_head}")
 
-    # Créer le modèle SMP UNet avec 3 canaux (sera étendu à 4)
+# ======================================================================
+# UNet (SMP)
+# ======================================================================
+if has_seg_model or (model_name == "unet" and not has_timm_model):
+    import segmentation_models_pytorch as smp
+
+    print("=== Reconstruction: SMP UNet (ResNet34, 4ch → 1 classe) ===")
+
     seg_model = smp.create_model(
         arch="unet",
         encoder_name="resnet34",
@@ -530,53 +576,100 @@ if has_seg_model or model_name == "unet":
         in_channels=3,
         encoder_weights=None,
     )
-
-    # Étendre la première couche à 4 canaux (comme set_first_layer)
     set_first_layer(seg_model.encoder, num_bands)
 
-    # Extraire les poids du state_dict avec le bon préfixe
-    # Checkpoint Lightning : clés = "net.seg_model.encoder.conv1.weight" etc.
-    clean_dict = {}
-    for k, v in state_dict.items():
-        new_k = k
-        # Enlever les préfixes Lightning / wrapper
-        for prefix in ["net.seg_model.", "model.seg_model.",
-                        "net.", "model."]:
-            if new_k.startswith(prefix):
-                new_k = new_k[len(prefix):]
-                break
-        clean_dict[new_k] = v
+    # Clés Lightning : "net.seg_model.encoder.conv1.weight" etc.
+    clean_dict = clean_state_dict(state_dict,
+        ["net.seg_model.", "model.seg_model.", "net.", "model."])
 
-    # Charger les poids
     missing, unexpected = seg_model.load_state_dict(clean_dict, strict=False)
     if missing:
         print(f"  Clés manquantes: {len(missing)}")
-        # Afficher les premières pour debug
-        for m in missing[:5]:
+        for m in missing[:3]:
             print(f"    - {m}")
     if unexpected:
         print(f"  Clés inattendues: {len(unexpected)}")
 
     seg_model.eval()
+    # Wrapper pour retourner un tensor (pas un dict)
     model = seg_model
-    print("Modèle SMP UNet chargé avec succès")
+    print("UNet SMP chargé avec succès")
 
-elif has_timm_model or model_name == "pvtv2":
-    print("Modèle PVTv2 détecté - architecture complexe (timm + seg head)")
-    print("La reconstruction PVTv2 nécessite le code source Open-Canopy.")
-    print("Utilisez le modèle UNet pour l inférence simplifiée.")
+# ======================================================================
+# PVTv2 (timm + SimpleSegmentationHead)
+# ======================================================================
+elif has_timm_model or has_seg_head or model_name == "pvtv2":
+    print("=== Reconstruction: PVTv2 (timm pvt_v2_b3, 4ch → 1 classe) ===")
+
+    if oc_src and os.path.isdir(oc_src):
+        # Ajouter le code source Open-Canopy au path Python
+        if oc_src not in sys.path:
+            sys.path.insert(0, oc_src)
+        print(f"Open-Canopy source ajouté: {oc_src}")
+
+        try:
+            from src.models.components.timmNet import timmNet
+            print("Import timmNet depuis Open-Canopy réussi")
+
+            # Reconstruire le modèle PVTv2 avec les mêmes paramètres
+            # que configs/model/PVTv2_B.yaml + _seg_default.yaml
+            pvt_model = timmNet(
+                backbone="pvt_v2_b3.in1k",
+                num_classes=1,
+                num_channels=num_bands,
+                pretrained=False,       # pas besoin, on charge le checkpoint
+                pretrained_path=None,
+                img_size=max(H, W),     # taille de l image d entrée
+                use_FPN=False,
+            )
+
+            # Clés Lightning : "net.model.xxx" et "net.seg_head.xxx"
+            clean_dict = clean_state_dict(state_dict, ["net.", "model."])
+
+            missing, unexpected = pvt_model.load_state_dict(
+                clean_dict, strict=False)
+            if missing:
+                print(f"  Clés manquantes: {len(missing)}")
+                for m in missing[:3]:
+                    print(f"    - {m}")
+            if unexpected:
+                print(f"  Clés inattendues: {len(unexpected)}")
+
+            pvt_model.eval()
+            model = pvt_model
+            print("PVTv2 chargé avec succès")
+
+        except ImportError as e:
+            print(f"Erreur import Open-Canopy: {e}")
+            print("Vérifiez que le code source est complet.")
+        except Exception as e:
+            print(f"Erreur reconstruction PVTv2: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("ERREUR: Le modèle PVTv2 nécessite le code source Open-Canopy.")
+        print(f"  Chemin fourni: {oc_src!r}")
+        print("  Utilisez le paramètre open_canopy_src dans pipeline_aoi_to_chm()")
+        print("  Exemple:")
+        print("    pipeline_aoi_to_chm('aoi.gpkg', model_name='pvtv2',")
+        print("      open_canopy_src='C:/Users/.../Open-Canopy')")
 
 # ======================================================================
 # Inférence
 # ======================================================================
 with torch.no_grad():
     if model is not None:
-        # Forward pass : le modèle SMP retourne directement le tensor
-        pred = model(tensor)
+        output = model(tensor)
+
+        # Le modèle retourne {"out": tensor} (Open-Canopy) ou tensor (SMP)
+        if isinstance(output, dict):
+            pred = output["out"]
+        else:
+            pred = output
+
         pred = pred.squeeze().cpu().numpy()
 
         # Le modèle prédit en mètres (targets = dm / 10)
-        # Clamp à des valeurs réalistes
         pred = np.clip(pred, 0, 50)
         pred = np.round(pred, 1)
 
@@ -586,14 +679,11 @@ with torch.no_grad():
         print("ATTENTION: Modèle non chargé, fallback estimation NDVI-based")
         img = tensor.squeeze().numpy()
         if num_bands >= 4:
-            # PIR est la bande 4 (index 3), Rouge est la bande 1 (index 0)
             pir = img[3]
             rouge = img[0]
             ndvi = (pir - rouge) / (pir + rouge + 1e-6)
-            # Estimation grossière : NDVI > 0.3 = végétation, hauteur prop.
             pred = np.clip(ndvi * 25, 0, 40)
         else:
-            brightness = img.mean(axis=0)
             greenness = img[1] / (img.mean(axis=0) + 1e-6)
             pred = np.clip(greenness * 20, 0, 40)
 
@@ -605,7 +695,7 @@ with rasterio.open("%s", "w", **profile) as dst:
     dst.write(pred.astype(np.float32), 1)
 
 print("Prédiction sauvegardée")
-', tmp_in_py, model_path_py, model_name, tmp_out_py)
+', tmp_in_py, model_path_py, model_name, oc_src_py, tmp_out_py)
 
   tryCatch({
     py_run_string(py_code)
@@ -669,7 +759,7 @@ combine_rvb_irc <- function(rvb, irc) {
 #' @param tile_size Taille des tuiles en mètres
 #' @return SpatRaster CHM prédit
 run_inference <- function(rvb, irc, model_path, model_name = "unet",
-                           tile_size = 1000) {
+                           tile_size = 1000, open_canopy_src = NULL) {
   message("\n=== Inférence Open-Canopy ===")
 
   # 1. Combiner RVB + PIR en 4 bandes
@@ -686,7 +776,7 @@ run_inference <- function(rvb, irc, model_path, model_name = "unet",
   for (i in seq_along(tiles)) {
     tile_name <- names(tiles)[i]
     message(sprintf("  Inférence tuile %d/%d: %s", i, length(tiles), tile_name))
-    pred <- predict_tile(tiles[[i]], model_path, model_name)
+    pred <- predict_tile(tiles[[i]], model_path, model_name, open_canopy_src)
     if (!is.null(pred)) {
       predictions[[tile_name]] <- pred
     }
@@ -719,12 +809,15 @@ run_inference <- function(rvb, irc, model_path, model_name = "unet",
 #' @param model_name "unet" ou "pvtv2"
 #' @param model_path Chemin local vers un checkpoint .ckpt (optionnel,
 #'   sinon téléchargé depuis HuggingFace)
+#' @param open_canopy_src Chemin vers le code source Open-Canopy (nécessaire
+#'   pour PVTv2, auto-détecté sinon)
 #' @param res_m Résolution de téléchargement IGN (0.2m par défaut)
 #' @return Liste avec tous les résultats
 pipeline_aoi_to_chm <- function(aoi_path,
                                   output_dir = file.path(getwd(), "outputs"),
                                   model_name = "unet",
                                   model_path = NULL,
+                                  open_canopy_src = NULL,
                                   res_m = RES_IGN) {
   dir_create(output_dir)
   t0 <- Sys.time()
@@ -755,8 +848,33 @@ pipeline_aoi_to_chm <- function(aoi_path,
 
   # --- Étape 4 : Inférence ---
   message("\n>>> ÉTAPE 4/5 : Inférence du modèle ", model_name)
+
+  # Auto-détecter le code source Open-Canopy si nécessaire (pour PVTv2)
+  if (is.null(open_canopy_src) && model_name == "pvtv2") {
+    # Chercher dans les emplacements courants
+    candidates <- c(
+      file.path(getwd(), "Open-Canopy"),
+      file.path(dirname(getwd()), "Open-Canopy"),
+      file.path(Sys.getenv("USERPROFILE"), "dev", "Open-Canopy"),
+      file.path(Sys.getenv("HOME"), "dev", "Open-Canopy")
+    )
+    for (cand in candidates) {
+      if (dir.exists(file.path(cand, "src", "models"))) {
+        open_canopy_src <- cand
+        message("Open-Canopy source détecté: ", open_canopy_src)
+        break
+      }
+    }
+    if (is.null(open_canopy_src)) {
+      stop("Le modèle PVTv2 nécessite le code source Open-Canopy.\n",
+           "Clonez le dépôt: git clone https://github.com/fajwel/Open-Canopy\n",
+           "Puis passez le chemin: open_canopy_src = 'chemin/vers/Open-Canopy'")
+    }
+  }
+
   # Combiner RVB + IRC (PIR) en 4 bandes, puis inférence
-  chm <- run_inference(ortho$rvb, ortho$irc, model_path, model_name)
+  chm <- run_inference(ortho$rvb, ortho$irc, model_path, model_name,
+                        open_canopy_src = open_canopy_src)
 
   # --- Étape 5 : Export ---
   message("\n>>> ÉTAPE 5/5 : Export des résultats")
