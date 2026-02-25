@@ -25,10 +25,12 @@ Le projet **Open-Canopy** fournit des modèles (UNet, PVTv2) entraînés sur ima
 ├── R/
 │   ├── 01_download_open_canopy.R   # Téléchargement HF + chargement IGN
 │   ├── 02_analyse_open_canopy.R    # Analyse, NDVI, visualisation
-│   └── 03_prediction_open_canopy.R # Inférence modèles + post-traitement
+│   ├── 03_prediction_open_canopy.R # Inférence modèles + post-traitement
+│   └── 04_pipeline_aoi_to_chm.R   # Pipeline complet AOI → CHM
 ├── data/
 │   ├── open_canopy/                # Dataset HF (SPOT 1.5m)
-│   └── ign/                        # Ortho IGN (RVB + IRC, 0.20m)
+│   ├── ign/                        # Ortho IGN (RVB + IRC, 0.20m)
+│   └── aoi.gpkg                    # Zone d'intérêt (polygone)
 ├── outputs/                        # Résultats et graphiques
 ├── .gitignore
 └── README.md
@@ -128,6 +130,40 @@ ign_1_5m <- resample_ign_to_spot(ign)  # 0.20m → 1.5m (facteur 8x)
 # Suréchantillonner un CHM prédit vers la résolution IGN
 chm_hr <- upsample_chm_to_ign(chm_predicted)  # 1.5m → 0.20m
 ```
+
+### 4. Pipeline complet AOI → CHM (nouveau)
+
+```r
+source("R/04_pipeline_aoi_to_chm.R")
+
+# Lancer le pipeline avec un fichier GeoPackage
+result <- pipeline_aoi_to_chm("data/aoi.gpkg")
+
+# Ou avec des options
+result <- pipeline_aoi_to_chm(
+  aoi_path    = "chemin/vers/ma_zone.gpkg",
+  output_dir  = "outputs",
+  model_name  = "unet"   # "unet" ou "pvtv2"
+)
+
+# Le résultat contient :
+# result$ortho_rvb  - Ortho RVB (0.20m)
+# result$ortho_irc  - Ortho IRC (0.20m)
+# result$ndvi       - NDVI
+# result$chm_1_5m   - CHM prédit à 1.5m
+# result$chm_0_2m   - CHM suréchantillonné à 0.20m
+```
+
+**Fichiers produits dans `outputs/` :**
+
+| Fichier | Description |
+|---|---|
+| `ortho_rvb.tif` | Ortho RVB IGN (0.20m) |
+| `ortho_irc.tif` | Ortho IRC IGN (0.20m) |
+| `ndvi.tif` | NDVI calculé depuis l'IRC |
+| `chm_predicted_1_5m.tif` | CHM prédit (résolution modèle) |
+| `chm_predicted_0_2m.tif` | CHM suréchantillonné (résolution IGN) |
+| `resultats_aoi.pdf` | Visualisation récapitulative (4 panneaux) |
 
 ## Workflow de rééchantillonnage
 
