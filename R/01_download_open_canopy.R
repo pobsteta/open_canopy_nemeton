@@ -45,7 +45,7 @@ IGN_WMTS_URL <- "https://data.geopf.fr/wmts"
 IGN_WMS_URL  <- "https://data.geopf.fr/wms-r"
 # Couches disponibles
 IGN_LAYER_ORTHO <- "ORTHOIMAGERY.ORTHOPHOTOS"
-IGN_LAYER_IRC   <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC-EXPRESS.2024"
+IGN_LAYER_IRC   <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC"
 
 # --- Répertoires ---
 DATA_DIR     <- file.path(getwd(), "data")
@@ -358,7 +358,7 @@ download_ign_wms <- function(bbox, layer = IGN_LAYER_ORTHO, res_m = RES_IGN,
     "SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap",
     "&LAYERS=", layer,
     "&CRS=EPSG:2154",
-    "&BBOX=", paste(ymin, xmin, ymax, xmax, sep = ","),
+    "&BBOX=", paste(xmin, ymin, xmax, ymax, sep = ","),
     "&WIDTH=", width,
     "&HEIGHT=", height,
     "&FORMAT=image/geotiff",

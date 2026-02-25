@@ -34,7 +34,7 @@ library(curl)
 # --- IGN Géoplateforme ---
 IGN_WMS_URL      <- "https://data.geopf.fr/wms-r"
 IGN_LAYER_ORTHO  <- "ORTHOIMAGERY.ORTHOPHOTOS"
-IGN_LAYER_IRC    <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC-EXPRESS.2024"
+IGN_LAYER_IRC    <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC"
 
 # --- Résolutions ---
 RES_IGN  <- 0.2   # BD ORTHO® IGN
@@ -112,13 +112,13 @@ download_wms_tile <- function(bbox, layer, res_m = RES_IGN, dest_file) {
   width  <- round((xmax - xmin) / res_m)
   height <- round((ymax - ymin) / res_m)
 
-  # WMS 1.3.0 avec CRS EPSG:2154 : BBOX = ymin,xmin,ymax,xmax
+  # WMS 1.3.0 avec CRS EPSG:2154 : BBOX = xmin,ymin,xmax,ymax (easting, northing)
   wms_url <- paste0(
     IGN_WMS_URL, "?",
     "SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap",
     "&LAYERS=", layer,
     "&CRS=EPSG:2154",
-    "&BBOX=", paste(ymin, xmin, ymax, xmax, sep = ","),
+    "&BBOX=", paste(xmin, ymin, xmax, ymax, sep = ","),
     "&WIDTH=", width,
     "&HEIGHT=", height,
     "&FORMAT=image/geotiff",
