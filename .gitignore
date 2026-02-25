@@ -1,0 +1,22 @@
+# Données
+data/
+*.tif
+*.tiff
+
+# Sorties
+outputs/
+
+# R
+.Rhistory
+.Rdata
+.RData
+.Rproj.user/
+*.Rproj
+
+# Environnement
+.env
+.Renviron
+
+# OS
+.DS_Store
+Thumbs.db
