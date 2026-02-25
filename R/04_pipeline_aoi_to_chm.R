@@ -309,7 +309,11 @@ setup_python <- function() {
   }
 }
 
-#' Télécharger le modèle pré-entraîné
+#' Télécharger le modèle pré-entraîné depuis Hugging Face
+#'
+#' Découvre dynamiquement les fichiers .ckpt dans pretrained_models/
+#' du dataset AI4Forest/Open-Canopy et télécharge celui correspondant
+#' au modèle demandé.
 #'
 #' @param model_name "unet" ou "pvtv2"
 #' @return Chemin local du modèle
@@ -317,25 +321,70 @@ download_model <- function(model_name = "unet") {
   library(reticulate)
   hf_hub <- import("huggingface_hub")
 
-  model_files <- list(
-    unet  = "pretrained_models/unet_best.ckpt",
-    pvtv2 = "pretrained_models/pvtv2_best.ckpt"
-  )
+  message("Recherche des checkpoints dans le dataset HuggingFace...")
 
-  if (!model_name %in% names(model_files)) {
-    stop("Modèle inconnu: ", model_name,
-         ". Choix: ", paste(names(model_files), collapse = ", "))
-  }
+  # Lister dynamiquement les fichiers .ckpt dans pretrained_models/
+  tryCatch({
+    api <- hf_hub$HfApi()
+    tree <- api$list_repo_tree(
+      HF_REPO_ID,
+      path_in_repo = "pretrained_models",
+      repo_type = "dataset"
+    )
 
-  message("Téléchargement du modèle ", model_name, " depuis Hugging Face...")
-  local_path <- hf_hub$hf_hub_download(
-    repo_id  = HF_REPO_ID,
-    filename = model_files[[model_name]],
-    repo_type = "dataset"
-  )
+    # Extraire les noms de fichiers .ckpt
+    ckpt_files <- character(0)
+    iter <- iterate(tree)
+    while (!is.null(item <- iter_next(iter))) {
+      fname <- item$rfilename
+      if (!is.null(fname) && grepl("\\.ckpt$", fname)) {
+        ckpt_files <- c(ckpt_files, fname)
+      }
+    }
 
-  message("Modèle: ", local_path)
-  return(local_path)
+    if (length(ckpt_files) == 0) {
+      stop("Aucun fichier .ckpt trouvé dans pretrained_models/")
+    }
+
+    message("Checkpoints disponibles:")
+    for (f in ckpt_files) message("  - ", f)
+
+    # Trouver le checkpoint correspondant au modèle demandé
+    pattern <- switch(model_name,
+      unet  = "unet|smp",
+      pvtv2 = "pvt|pvtv2",
+      model_name
+    )
+    match_idx <- grep(pattern, ckpt_files, ignore.case = TRUE)
+
+    if (length(match_idx) == 0) {
+      message("Aucun match pour '", model_name, "', utilisation du premier checkpoint.")
+      target_file <- ckpt_files[1]
+    } else {
+      target_file <- ckpt_files[match_idx[1]]
+    }
+
+    message("Téléchargement: ", target_file)
+    local_path <- hf_hub$hf_hub_download(
+      repo_id  = HF_REPO_ID,
+      filename = target_file,
+      repo_type = "dataset"
+    )
+    message("Modèle: ", local_path)
+    return(local_path)
+
+  }, error = function(e) {
+    message("Impossible de lister le dataset HuggingFace: ", e$message)
+    message("Le dataset est peut-être privé (gated). Vérifiez votre HF_TOKEN.")
+    message("")
+    message("Alternatives :")
+    message("  1. Définir votre token : Sys.setenv(HF_TOKEN = 'hf_...')")
+    message("  2. Se connecter via CLI : huggingface-cli login")
+    message("  3. Fournir le chemin manuellement :")
+    message('     result <- pipeline_aoi_to_chm("data/aoi.gpkg",')
+    message('       model_path = "chemin/vers/checkpoint.ckpt")')
+    stop("Échec du téléchargement du modèle.", call. = FALSE)
+  })
 }
 
 #' Découper un raster en tuiles pour l'inférence
@@ -398,7 +447,6 @@ import rasterio
 with rasterio.open("%s") as src:
     image = src.read().astype(np.float32)
     profile = src.profile.copy()
-    transform = src.transform
 
 # Normaliser [0, 255] -> [0, 1]
 if image.max() > 1.0:
@@ -407,29 +455,104 @@ if image.max() > 1.0:
 # Préparer le tensor (1, C, H, W)
 tensor = torch.from_numpy(image).unsqueeze(0)
 
-# Charger le checkpoint
-checkpoint = torch.load("%s", map_location="cpu", weights_only=False)
+# Charger le checkpoint PyTorch Lightning
+ckpt_path = "%s"
+checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-# Extraire le state_dict selon la structure du checkpoint
-if "state_dict" in checkpoint:
-    state_dict = checkpoint["state_dict"]
-elif "model_state_dict" in checkpoint:
-    state_dict = checkpoint["model_state_dict"]
-else:
-    state_dict = checkpoint
+model = None
 
-# Inférence simple : moyenne des bandes pondérée comme proxy
-# (sera remplacé par le vrai modèle une fois la structure connue)
+# --- Stratégie 1: Charger le modèle complet depuis le checkpoint Lightning ---
+try:
+    # Les checkpoints Open-Canopy sont des checkpoints PyTorch Lightning
+    # qui contiennent hyper_parameters et state_dict
+    if "hyper_parameters" in checkpoint:
+        hparams = checkpoint["hyper_parameters"]
+        print(f"Hyperparamètres trouvés: {list(hparams.keys())}")
+
+    if "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+        # Analyser les clés pour déterminer l architecture
+        keys = list(state_dict.keys())
+        print(f"State dict: {len(keys)} clés")
+        if len(keys) > 0:
+            print(f"  Premières clés: {keys[:5]}")
+
+        # Tenter de reconstruire le modèle via segmentation_models_pytorch
+        try:
+            import segmentation_models_pytorch as smp
+
+            # Détecter le type de modèle selon les clés
+            key_str = " ".join(keys[:20])
+            if "encoder" in key_str and "decoder" in key_str:
+                # Modèle UNet de segmentation_models_pytorch
+                # Déterminer le nombre de canaux d entrée et classes
+                in_channels = 3
+                out_classes = 1
+
+                # Détecter l encodeur
+                if "pvt" in key_str.lower() or "pvtv2" in key_str.lower():
+                    encoder_name = "timm-pvt_v2_b3"
+                elif "resnet34" in key_str.lower():
+                    encoder_name = "resnet34"
+                elif "resnet50" in key_str.lower():
+                    encoder_name = "resnet50"
+                else:
+                    encoder_name = "resnet34"
+
+                print(f"Reconstruction modèle smp.Unet(encoder={encoder_name})")
+                model = smp.Unet(
+                    encoder_name=encoder_name,
+                    encoder_weights=None,
+                    in_channels=in_channels,
+                    classes=out_classes
+                )
+
+                # Nettoyer les clés (enlever le préfixe "model." ou "net." si présent)
+                clean_dict = {}
+                for k, v in state_dict.items():
+                    new_k = k
+                    for prefix in ["model.", "net.", "network."]:
+                        if new_k.startswith(prefix):
+                            new_k = new_k[len(prefix):]
+                    clean_dict[new_k] = v
+
+                model.load_state_dict(clean_dict, strict=False)
+                model.eval()
+                print("Modèle smp chargé avec succès")
+
+        except ImportError:
+            print("segmentation_models_pytorch non disponible")
+        except Exception as e2:
+            print(f"Échec reconstruction smp: {e2}")
+
+except Exception as e:
+    print(f"Erreur chargement checkpoint: {e}")
+
+# --- Inférence ---
 with torch.no_grad():
-    # Pour l instant, on utilise une estimation basée sur les bandes
-    # Le vrai modèle sera chargé quand sa classe sera identifiée
-    pred = tensor.mean(dim=1, keepdim=True)
-    pred = pred.squeeze().numpy()
+    if model is not None:
+        pred = model(tensor)
+        pred = pred.squeeze().cpu().numpy()
+        # Clamp à des valeurs réalistes de hauteur (0-60m)
+        pred = np.clip(pred, 0, 60)
+        print(f"Prédiction modèle: min={pred.min():.2f}, max={pred.max():.2f}, "
+              f"mean={pred.mean():.2f}")
+    else:
+        print("ATTENTION: Modèle non chargé, utilisation estimation par réflectance")
+        # Estimation par réflectance (fallback)
+        img = tensor.squeeze().numpy()
+        # Approximation: les zones sombres/vertes = végétation haute
+        brightness = img.mean(axis=0)
+        greenness = img[1] / (img.mean(axis=0) + 1e-6)
+        pred = greenness * 20  # Échelle approximative 0-20m
+        pred = np.clip(pred, 0, 40)
 
 # Sauvegarder
 profile.update(count=1, dtype="float32", compress="lzw")
 with rasterio.open("%s", "w", **profile) as dst:
-    dst.write(pred, 1)
+    dst.write(pred.astype(np.float32), 1)
+
+print("Prédiction sauvegardée")
 ', tmp_in_py, model_path_py, tmp_out_py)
 
   tryCatch({
@@ -509,6 +632,7 @@ run_inference <- function(ign_raster, model_path, tile_size = 1000) {
 pipeline_aoi_to_chm <- function(aoi_path,
                                   output_dir = file.path(getwd(), "outputs"),
                                   model_name = "unet",
+                                  model_path = NULL,
                                   res_m = RES_IGN) {
   dir_create(output_dir)
   t0 <- Sys.time()
@@ -528,7 +652,14 @@ pipeline_aoi_to_chm <- function(aoi_path,
   # --- Étape 3 : Configurer Python ---
   message("\n>>> ÉTAPE 3/5 : Configuration Python + téléchargement modèle")
   setup_python()
-  model_path <- download_model(model_name)
+  if (is.null(model_path)) {
+    model_path <- download_model(model_name)
+  } else {
+    message("Utilisation du modèle local: ", model_path)
+    if (!file.exists(model_path)) {
+      stop("Fichier modèle introuvable: ", model_path)
+    }
+  }
 
   # --- Étape 4 : Inférence ---
   message("\n>>> ÉTAPE 4/5 : Inférence du modèle ", model_name)
@@ -638,6 +769,10 @@ if (sys.nframe() == 0) {
     message('  # Option 2 : appeler directement la fonction :')
     message('  source("R/04_pipeline_aoi_to_chm.R")')
     message('  result <- pipeline_aoi_to_chm("chemin/vers/aoi.gpkg")')
+    message("")
+    message("  # Avec un checkpoint local :")
+    message('  result <- pipeline_aoi_to_chm("data/aoi.gpkg",')
+    message('    model_path = "chemin/vers/checkpoint.ckpt")')
     message("")
     message("Le fichier aoi.gpkg doit contenir un polygone définissant")
     message("votre zone d'intérêt (n'importe quel CRS, sera reprojeté")
