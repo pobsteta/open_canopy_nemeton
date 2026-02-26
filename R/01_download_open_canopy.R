@@ -50,7 +50,7 @@ IGN_LAYER_IRC   <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC"
 # --- Millésime (NULL = couche la plus récente disponible) ---
 # Exemples : "2024", "2023", "2021"...
 # Ortho RVB → couche ORTHOIMAGERY.ORTHOPHOTOS{année}
-# IRC       → couche ORTHOIMAGERY.ORTHOPHOTOS.IRC{année}
+# IRC       → couche ORTHOIMAGERY.ORTHOPHOTOS.IRC.{année}
 MILLESIME_ORTHO <- NULL
 MILLESIME_IRC   <- NULL
 
@@ -69,7 +69,7 @@ ign_layer_name <- function(type = c("ortho", "irc"), millesime = NULL) {
   if (type == "ortho") {
     return(paste0("ORTHOIMAGERY.ORTHOPHOTOS", millesime))
   } else {
-    return(paste0("ORTHOIMAGERY.ORTHOPHOTOS.IRC", millesime))
+    return(paste0("ORTHOIMAGERY.ORTHOPHOTOS.IRC.", millesime))
   }
 }
 
