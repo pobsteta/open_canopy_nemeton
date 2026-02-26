@@ -459,7 +459,7 @@ download_model <- function(model_name = "unet") {
     message("Téléchargement: ", target_file)
     local_path <- hf_hub$hf_hub_download(
       repo_id  = HF_REPO_ID,
-      filename = target_file,
+      filename = paste0("pretrained_models/", target_file),
       repo_type = "dataset"
     )
     message("Modèle: ", local_path)
