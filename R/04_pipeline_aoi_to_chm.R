@@ -609,11 +609,51 @@ if oc_src and os.path.isdir(oc_src):
         sys.path.insert(0, oc_src)
         print(f"Open-Canopy source ajoute au path: {oc_src}")
 
+import types as _types
+
+class _Dummy:
+    """Classe factice pour depickling des references manquantes."""
+    def __init__(self, *a, **kw): pass
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+
+class _MockMod(_types.ModuleType):
+    """Module factice dont les attributs retournent _Dummy."""
+    def __getattr__(self, name):
+        return _Dummy
+
+class _SrcFinder:
+    """Import hook pour simuler le package src (Open-Canopy)."""
+    def find_module(self, fullname, path=None):
+        if fullname == "src" or fullname.startswith("src."):
+            return self
+        return None
+    def load_module(self, fullname):
+        if fullname in sys.modules:
+            return sys.modules[fullname]
+        mod = _MockMod(fullname)
+        mod.__loader__ = self
+        mod.__path__ = []
+        mod.__package__ = fullname
+        sys.modules[fullname] = mod
+        return mod
+
 try:
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 except (ModuleNotFoundError, ImportError) as e:
-    print(f"  Chargement standard echoue ({e}), mode securise...")
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    print(f"  Chargement direct echoue: {e}")
+    print("  Simulation des modules manquants pour le depickling...")
+    _finder = _SrcFinder()
+    sys.meta_path.insert(0, _finder)
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    finally:
+        sys.meta_path.remove(_finder)
+        for _k in list(sys.modules):
+            if _k == "src" or _k.startswith("src."):
+                del sys.modules[_k]
+    print("  Checkpoint charge avec modules simules")
 
 print(f"Checkpoint cles: {list(checkpoint.keys())}")
 
