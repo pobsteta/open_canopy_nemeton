@@ -861,8 +861,11 @@ print("Prediction sauvegardee")
 
   tryCatch({
     py_run_string(py_code)
-    pred <- rast(tmp_out)
+    pred_disk <- rast(tmp_out)
+    # Forcer la lecture en mémoire AVANT de supprimer le fichier temp
+    pred <- setValues(rast(pred_disk), values(pred_disk))
     names(pred) <- "chm_predicted"
+    rm(pred_disk)
     return(pred)
   }, error = function(e) {
     warning("Erreur inférence: ", e$message)
@@ -1046,11 +1049,6 @@ pipeline_aoi_to_chm <- function(aoi_path,
 
   # --- Étape 5 : Export ---
   message("\n>>> ÉTAPE 5/5 : Export des résultats")
-
-  # Forcer le CHM en mémoire pour éviter les problèmes de chemins temp Windows
-  if (!inMemory(chm)) {
-    chm <- setValues(rast(chm), values(chm))
-  }
 
   # CHM à la résolution du modèle (1.5m)
   chm_path <- file.path(output_dir, "chm_predicted_1_5m.tif")
