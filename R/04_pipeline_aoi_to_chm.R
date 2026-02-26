@@ -600,7 +600,20 @@ print(f"Tensor: shape={tuple(tensor.shape)}, "
 # Charger le checkpoint PyTorch Lightning
 # ======================================================================
 ckpt_path = "__MODEL_PATH__"
-checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+oc_src = "__OC_SRC__"
+
+# Ajouter Open-Canopy au path avant chargement (le checkpoint peut
+# referencer des classes du module src)
+if oc_src and os.path.isdir(oc_src):
+    if oc_src not in sys.path:
+        sys.path.insert(0, oc_src)
+        print(f"Open-Canopy source ajoute au path: {oc_src}")
+
+try:
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+except (ModuleNotFoundError, ImportError) as e:
+    print(f"  Chargement standard echoue ({e}), mode securise...")
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
 print(f"Checkpoint cles: {list(checkpoint.keys())}")
 
@@ -659,7 +672,6 @@ def clean_state_dict(state_dict, prefix_to_strip):
 # Reconstruire le modele selon l architecture
 # ======================================================================
 model_name = "__MODEL_NAME__"
-oc_src = "__OC_SRC__"
 model = None
 
 # Detecter le type de modele depuis les cles du checkpoint
@@ -711,11 +723,6 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
     print("=== Reconstruction: PVTv2 (timm pvt_v2_b3, 4ch, 1 classe) ===")
 
     if oc_src and os.path.isdir(oc_src):
-        # Ajouter le code source Open-Canopy au path Python
-        if oc_src not in sys.path:
-            sys.path.insert(0, oc_src)
-        print(f"Open-Canopy source ajoute: {oc_src}")
-
         try:
             from src.models.components.timmNet import timmNet
             print("Import timmNet depuis Open-Canopy reussi")
@@ -1002,8 +1009,8 @@ pipeline_aoi_to_chm <- function(aoi_path,
 
   # CHM à la résolution du modèle (1.5m)
   chm_path <- file.path(output_dir, "chm_predicted_1_5m.tif")
-  writeRaster(chm, chm_path, overwrite = TRUE,
-              gdal = c("COMPRESS=LZW"))
+  if (file.exists(chm_path)) file.remove(chm_path)
+  writeRaster(chm, chm_path, gdal = c("COMPRESS=LZW"))
   message("CHM 1.5m: ", chm_path)
 
   # Suréchantillonner le CHM vers la résolution IGN (0.20m)
@@ -1014,8 +1021,8 @@ pipeline_aoi_to_chm <- function(aoi_path,
   chm_hr <- crop(chm_hr, vect(st_union(aoi)))
 
   chm_hr_path <- file.path(output_dir, "chm_predicted_0_2m.tif")
-  writeRaster(chm_hr, chm_hr_path, overwrite = TRUE,
-              gdal = c("COMPRESS=LZW"))
+  if (file.exists(chm_hr_path)) file.remove(chm_hr_path)
+  writeRaster(chm_hr, chm_hr_path, gdal = c("COMPRESS=LZW"))
   message("CHM 0.2m: ", chm_hr_path)
 
   # --- NDVI si IRC disponible ---
@@ -1024,7 +1031,8 @@ pipeline_aoi_to_chm <- function(aoi_path,
   ndvi  <- (pir - rouge) / (pir + rouge)
   names(ndvi) <- "NDVI"
   ndvi_path <- file.path(output_dir, "ndvi.tif")
-  writeRaster(ndvi, ndvi_path, overwrite = TRUE,
+  if (file.exists(ndvi_path)) file.remove(ndvi_path)
+  writeRaster(ndvi, ndvi_path,
               gdal = c("COMPRESS=LZW"))
   message("NDVI:     ", ndvi_path)
 
