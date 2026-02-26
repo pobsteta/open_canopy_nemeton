@@ -1047,6 +1047,11 @@ pipeline_aoi_to_chm <- function(aoi_path,
   # --- Étape 5 : Export ---
   message("\n>>> ÉTAPE 5/5 : Export des résultats")
 
+  # Forcer le CHM en mémoire pour éviter les problèmes de chemins temp Windows
+  if (!inMemory(chm)) {
+    chm <- setValues(rast(chm), values(chm))
+  }
+
   # CHM à la résolution du modèle (1.5m)
   chm_path <- file.path(output_dir, "chm_predicted_1_5m.tif")
   if (file.exists(chm_path)) file.remove(chm_path)
@@ -1056,13 +1061,12 @@ pipeline_aoi_to_chm <- function(aoi_path,
   # Suréchantillonner le CHM vers la résolution IGN (0.20m)
   message("Suréchantillonnage CHM vers 0.20m...")
   disagg_factor <- round(RES_SPOT / RES_IGN)
-  chm_hr <- disagg(chm, fact = disagg_factor, method = "bilinear")
-  # Découper à l'emprise de l'AOI
-  chm_hr <- crop(chm_hr, vect(st_union(aoi)))
-
   chm_hr_path <- file.path(output_dir, "chm_predicted_0_2m.tif")
   if (file.exists(chm_hr_path)) file.remove(chm_hr_path)
-  writeRaster(chm_hr, chm_hr_path, gdal = c("COMPRESS=LZW"))
+  chm_hr <- disagg(chm, fact = disagg_factor, method = "bilinear")
+  chm_hr <- crop(chm_hr, vect(st_union(aoi)),
+                 filename = chm_hr_path, overwrite = TRUE,
+                 gdal = c("COMPRESS=LZW"))
   message("CHM 0.2m: ", chm_hr_path)
 
   # --- NDVI si IRC disponible ---
@@ -1072,7 +1076,7 @@ pipeline_aoi_to_chm <- function(aoi_path,
   names(ndvi) <- "NDVI"
   ndvi_path <- file.path(output_dir, "ndvi.tif")
   if (file.exists(ndvi_path)) file.remove(ndvi_path)
-  writeRaster(ndvi, ndvi_path,
+  writeRaster(ndvi, ndvi_path, overwrite = TRUE,
               gdal = c("COMPRESS=LZW"))
   message("NDVI:     ", ndvi_path)
 
