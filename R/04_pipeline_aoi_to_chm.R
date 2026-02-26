@@ -262,13 +262,34 @@ download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN,
                                     millesime_irc = MILLESIME_IRC) {
   dir_create(output_dir)
 
-  bbox <- as.numeric(st_bbox(st_union(aoi)))
-
   # Résoudre les couches WMS selon le millésime
   layer_ortho <- ign_layer_name("ortho", millesime_ortho)
   layer_irc   <- ign_layer_name("irc",   millesime_irc)
   label_ortho <- if (is.null(millesime_ortho)) "plus récent" else millesime_ortho
   label_irc   <- if (is.null(millesime_irc))   "plus récent" else millesime_irc
+
+  # Vérifier si les fichiers existent déjà (cache)
+  rvb_path <- file.path(output_dir, "ortho_rvb.tif")
+  irc_path <- file.path(output_dir, "ortho_irc.tif")
+
+  if (file.exists(rvb_path) && file.exists(irc_path)) {
+    message("\n=== Ortho IGN déjà présentes (cache) ===")
+    message(sprintf("  RVB: %s", rvb_path))
+    message(sprintf("  IRC: %s", irc_path))
+    message("Réutilisation des fichiers existants (supprimez-les pour forcer le re-téléchargement).")
+
+    rvb <- rast(rvb_path)
+    irc <- rast(irc_path)
+
+    return(list(rvb = rvb, irc = irc,
+                rvb_path = rvb_path, irc_path = irc_path,
+                millesime_ortho = millesime_ortho,
+                millesime_irc = millesime_irc,
+                layer_ortho = layer_ortho,
+                layer_irc = layer_irc))
+  }
+
+  bbox <- as.numeric(st_bbox(st_union(aoi)))
 
   message(sprintf("\n=== Téléchargement ortho IGN pour l'AOI ==="))
   message(sprintf("Emprise: %.0f, %.0f - %.0f, %.0f (Lambert-93)",
@@ -297,8 +318,6 @@ download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN,
   irc <- crop(irc, aoi_vect)
 
   # Sauvegarder les mosaïques finales
-  rvb_path <- file.path(output_dir, "ortho_rvb.tif")
-  irc_path <- file.path(output_dir, "ortho_irc.tif")
   writeRaster(rvb, rvb_path, overwrite = TRUE)
   writeRaster(irc, irc_path, overwrite = TRUE)
 
