@@ -1126,7 +1126,9 @@ pipeline_aoi_to_chm <- function(aoi_path,
                           max_col_value = 255) +
       labs(title = sprintf("Ortho RVB 0.20m (%s)", label_ortho)) +
       theme_minimal() +
-      theme(axis.text = element_text(size = 6),
+      theme(axis.text = element_blank(),
+            axis.title = element_blank(),
+            axis.ticks = element_blank(),
             plot.title = element_text(size = 10, face = "bold"))
 
     # Panel 2 : Ortho IRC fausses couleurs
@@ -1135,7 +1137,9 @@ pipeline_aoi_to_chm <- function(aoi_path,
                           max_col_value = 255) +
       labs(title = sprintf("Ortho IRC 0.20m (%s)", label_irc)) +
       theme_minimal() +
-      theme(axis.text = element_text(size = 6),
+      theme(axis.text = element_blank(),
+            axis.title = element_blank(),
+            axis.ticks = element_blank(),
             plot.title = element_text(size = 10, face = "bold"))
 
     # Panel 3 : NDVI
@@ -1149,7 +1153,9 @@ pipeline_aoi_to_chm <- function(aoi_path,
       ) +
       labs(title = "NDVI (depuis IRC)") +
       theme_minimal() +
-      theme(axis.text = element_text(size = 6),
+      theme(axis.text = element_blank(),
+            axis.title = element_blank(),
+            axis.ticks = element_blank(),
             plot.title = element_text(size = 10, face = "bold"))
 
     # Panel 4 : CHM
@@ -1162,7 +1168,9 @@ pipeline_aoi_to_chm <- function(aoi_path,
       ) +
       labs(title = paste("CHM", model_name)) +
       theme_minimal() +
-      theme(axis.text = element_text(size = 6),
+      theme(axis.text = element_blank(),
+            axis.title = element_blank(),
+            axis.ticks = element_blank(),
             plot.title = element_text(size = 10, face = "bold"))
 
     p_combined <- (p_rvb | p_irc) / (p_ndvi | p_chm) +
