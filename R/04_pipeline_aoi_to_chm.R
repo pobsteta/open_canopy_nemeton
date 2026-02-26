@@ -399,23 +399,38 @@ download_model <- function(model_name = "unet") {
   # Lister dynamiquement les fichiers .ckpt dans pretrained_models/
   tryCatch({
     api <- hf_hub$HfApi()
-    tree <- api$list_repo_tree(
-      HF_REPO_ID,
-      path_in_repo = "pretrained_models",
-      repo_type = "dataset"
-    )
 
-    # Extraire les noms de fichiers .ckpt
-    # Convertir le générateur Python en liste R
-    items <- tryCatch(
-      reticulate::iterate(tree),
-      error = function(e) as.list(tree)
-    )
+    # Utiliser list_repo_files (retourne des chaînes) — plus robuste que list_repo_tree
+    all_files <- tryCatch({
+      files <- api$list_repo_files(
+        HF_REPO_ID,
+        repo_type = "dataset"
+      )
+      reticulate::iterate(files)
+    }, error = function(e) {
+      # Fallback : list_repo_tree avec gestion des attributs
+      tree <- api$list_repo_tree(
+        HF_REPO_ID,
+        path_in_repo = "pretrained_models",
+        repo_type = "dataset"
+      )
+      items <- tryCatch(reticulate::iterate(tree), error = function(e2) as.list(tree))
+      paths <- character(0)
+      for (item in items) {
+        p <- tryCatch(item$path, error = function(e3)
+          tryCatch(item$rfilename, error = function(e4)
+            tryCatch(as.character(item), error = function(e5) "")))
+        if (nzchar(p)) paths <- c(paths, p)
+      }
+      paths
+    })
+
+    # Filtrer les .ckpt dans pretrained_models/
     ckpt_files <- character(0)
-    for (item in items) {
-      fname <- item$rfilename
-      if (!is.null(fname) && grepl("\\.ckpt$", fname)) {
-        ckpt_files <- c(ckpt_files, fname)
+    for (f in all_files) {
+      fname <- as.character(f)
+      if (grepl("^pretrained_models/", fname) && grepl("\\.ckpt$", fname)) {
+        ckpt_files <- c(ckpt_files, basename(fname))
       }
     }
 
