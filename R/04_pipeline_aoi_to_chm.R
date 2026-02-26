@@ -280,6 +280,9 @@ download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN,
 
     rvb <- rast(rvb_path)
     irc <- rast(irc_path)
+    # Restaurer les noms de bandes (perdus lors de l'écriture GeoTIFF)
+    names(rvb)[1:min(3, nlyr(rvb))] <- c("Rouge", "Vert", "Bleu")[1:min(3, nlyr(rvb))]
+    names(irc)[1:min(3, nlyr(irc))] <- c("PIR", "Rouge", "Vert")[1:min(3, nlyr(irc))]
 
     return(list(rvb = rvb, irc = irc,
                 rvb_path = rvb_path, irc_path = irc_path,
@@ -325,6 +328,9 @@ download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN,
   # pointent vers ortho_rvb.tif / ortho_irc.tif (et non les tuiles)
   rvb <- rast(rvb_path)
   irc <- rast(irc_path)
+  # Restaurer les noms de bandes (perdus lors de l'écriture GeoTIFF)
+  names(rvb)[1:min(3, nlyr(rvb))] <- c("Rouge", "Vert", "Bleu")[1:min(3, nlyr(rvb))]
+  names(irc)[1:min(3, nlyr(irc))] <- c("PIR", "Rouge", "Vert")[1:min(3, nlyr(irc))]
 
   message(sprintf("\nRVB sauvegardé: %s (%d x %d px)", rvb_path, ncol(rvb), nrow(rvb)))
   message(sprintf("IRC sauvegardé: %s (%d x %d px)", irc_path, ncol(irc), nrow(irc)))
@@ -754,8 +760,8 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
         print(f"  Chemin fourni: {oc_src!r}")
         print("  Utilisez le parametre open_canopy_src dans pipeline_aoi_to_chm()")
         print("  Exemple:")
-        print("    pipeline_aoi_to_chm(\"aoi.gpkg\", model_name=\"pvtv2\",")
-        print("      open_canopy_src=\"C:/Users/.../Open-Canopy\")")
+        print(\'    pipeline_aoi_to_chm("aoi.gpkg", model_name="pvtv2",\')
+        print(\'      open_canopy_src="C:/Users/.../Open-Canopy")\')
 
 # ======================================================================
 # Inference
