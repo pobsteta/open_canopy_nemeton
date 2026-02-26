@@ -321,6 +321,11 @@ download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN,
   writeRaster(rvb, rvb_path, overwrite = TRUE)
   writeRaster(irc, irc_path, overwrite = TRUE)
 
+  # Recharger depuis les fichiers consolidés pour que les SpatRaster
+  # pointent vers ortho_rvb.tif / ortho_irc.tif (et non les tuiles)
+  rvb <- rast(rvb_path)
+  irc <- rast(irc_path)
+
   message(sprintf("\nRVB sauvegardé: %s (%d x %d px)", rvb_path, ncol(rvb), nrow(rvb)))
   message(sprintf("IRC sauvegardé: %s (%d x %d px)", irc_path, ncol(irc), nrow(irc)))
 
