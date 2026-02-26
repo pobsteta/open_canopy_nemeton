@@ -567,7 +567,7 @@ predict_tile <- function(tile, model_path, model_name = "unet",
     oc_src_py <- gsub("\\\\", "/", open_canopy_src)
   }
 
-  py_code <- sprintf('
+  py_code <- '
 import sys
 import os
 import torch
@@ -578,12 +578,12 @@ import rasterio
 # ======================================================================
 # Charger l image 4 bandes (R, G, B, PIR)
 # ======================================================================
-with rasterio.open("%s") as src:
+with rasterio.open("__INPUT_PATH__") as src:
     image = src.read().astype(np.float32)  # (C, H, W)
     profile = src.profile.copy()
 
 num_bands, H, W = image.shape
-print(f"Image chargée: {num_bands} bandes, {H}x{W} px")
+print(f"Image chargee: {num_bands} bandes, {H}x{W} px")
 
 # Open-Canopy utilise mean=0, std=1 : pas de normalisation
 tensor = torch.from_numpy(image).unsqueeze(0)  # (1, C, H, W)
@@ -593,19 +593,19 @@ print(f"Tensor: shape={tuple(tensor.shape)}, "
 # ======================================================================
 # Charger le checkpoint PyTorch Lightning
 # ======================================================================
-ckpt_path = "%s"
+ckpt_path = "__MODEL_PATH__"
 checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-print(f"Checkpoint clés: {list(checkpoint.keys())}")
+print(f"Checkpoint cles: {list(checkpoint.keys())}")
 
 state_dict = checkpoint.get("state_dict", checkpoint)
 keys = list(state_dict.keys())
-print(f"State dict: {len(keys)} paramètres")
-print(f"  Premières clés: {keys[:5]}")
+print(f"State dict: {len(keys)} parametres")
+print(f"  Premieres cles: {keys[:5]}")
 
 # ======================================================================
 # Fonction set_first_layer (reproduction du code Open-Canopy)
-# Adapte la première couche conv de 3 → N canaux
+# Adapte la premiere couche conv de 3 a N canaux
 # ======================================================================
 def set_first_layer(model, n_channels):
     if n_channels == 3:
@@ -635,10 +635,10 @@ def set_first_layer(model, n_channels):
         module.in_channels = n_channels
 
 # ======================================================================
-# Nettoyage des clés du state_dict
+# Nettoyage des cles du state_dict
 # ======================================================================
 def clean_state_dict(state_dict, prefix_to_strip):
-    """Enlève un préfixe des clés du state_dict."""
+    """Enleve un prefixe des cles du state_dict."""
     clean = {}
     for k, v in state_dict.items():
         new_k = k
@@ -650,18 +650,18 @@ def clean_state_dict(state_dict, prefix_to_strip):
     return clean
 
 # ======================================================================
-# Reconstruire le modèle selon l architecture
+# Reconstruire le modele selon l architecture
 # ======================================================================
-model_name = "%s"
-oc_src = "%s"
+model_name = "__MODEL_NAME__"
+oc_src = "__OC_SRC__"
 model = None
 
-# Détecter le type de modèle depuis les clés du checkpoint
+# Detecter le type de modele depuis les cles du checkpoint
 has_seg_model = any("seg_model" in k for k in keys)
 has_timm_model = any("net.model." in k for k in keys)
 has_seg_head = any("net.seg_head." in k for k in keys)
 
-print(f"Détection: seg_model={has_seg_model}, timm_model={has_timm_model}, "
+print(f"Detection: seg_model={has_seg_model}, timm_model={has_timm_model}, "
       f"seg_head={has_seg_head}")
 
 # ======================================================================
@@ -670,7 +670,7 @@ print(f"Détection: seg_model={has_seg_model}, timm_model={has_timm_model}, "
 if has_seg_model or (model_name == "unet" and not has_timm_model):
     import segmentation_models_pytorch as smp
 
-    print("=== Reconstruction: SMP UNet (ResNet34, 4ch → 1 classe) ===")
+    print("=== Reconstruction: SMP UNet (ResNet34, 4ch, 1 classe) ===")
 
     seg_model = smp.create_model(
         arch="unet",
@@ -681,40 +681,40 @@ if has_seg_model or (model_name == "unet" and not has_timm_model):
     )
     set_first_layer(seg_model.encoder, num_bands)
 
-    # Clés Lightning : "net.seg_model.encoder.conv1.weight" etc.
+    # Cles Lightning : "net.seg_model.encoder.conv1.weight" etc.
     clean_dict = clean_state_dict(state_dict,
         ["net.seg_model.", "model.seg_model.", "net.", "model."])
 
     missing, unexpected = seg_model.load_state_dict(clean_dict, strict=False)
     if missing:
-        print(f"  Clés manquantes: {len(missing)}")
+        print(f"  Cles manquantes: {len(missing)}")
         for m in missing[:3]:
             print(f"    - {m}")
     if unexpected:
-        print(f"  Clés inattendues: {len(unexpected)}")
+        print(f"  Cles inattendues: {len(unexpected)}")
 
     seg_model.eval()
     # Wrapper pour retourner un tensor (pas un dict)
     model = seg_model
-    print("UNet SMP chargé avec succès")
+    print("UNet SMP charge avec succes")
 
 # ======================================================================
 # PVTv2 (timm + SimpleSegmentationHead)
 # ======================================================================
 elif has_timm_model or has_seg_head or model_name == "pvtv2":
-    print("=== Reconstruction: PVTv2 (timm pvt_v2_b3, 4ch → 1 classe) ===")
+    print("=== Reconstruction: PVTv2 (timm pvt_v2_b3, 4ch, 1 classe) ===")
 
     if oc_src and os.path.isdir(oc_src):
         # Ajouter le code source Open-Canopy au path Python
         if oc_src not in sys.path:
             sys.path.insert(0, oc_src)
-        print(f"Open-Canopy source ajouté: {oc_src}")
+        print(f"Open-Canopy source ajoute: {oc_src}")
 
         try:
             from src.models.components.timmNet import timmNet
-            print("Import timmNet depuis Open-Canopy réussi")
+            print("Import timmNet depuis Open-Canopy reussi")
 
-            # Reconstruire le modèle PVTv2 avec les mêmes paramètres
+            # Reconstruire le modele PVTv2 avec les memes parametres
             # que configs/model/PVTv2_B.yaml + _seg_default.yaml
             pvt_model = timmNet(
                 backbone="pvt_v2_b3.in1k",
@@ -722,49 +722,49 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
                 num_channels=num_bands,
                 pretrained=False,       # pas besoin, on charge le checkpoint
                 pretrained_path=None,
-                img_size=max(H, W),     # taille de l image d entrée
+                img_size=max(H, W),     # taille de l image d entree
                 use_FPN=False,
             )
 
-            # Clés Lightning : "net.model.xxx" et "net.seg_head.xxx"
+            # Cles Lightning : "net.model.xxx" et "net.seg_head.xxx"
             clean_dict = clean_state_dict(state_dict, ["net.", "model."])
 
             missing, unexpected = pvt_model.load_state_dict(
                 clean_dict, strict=False)
             if missing:
-                print(f"  Clés manquantes: {len(missing)}")
+                print(f"  Cles manquantes: {len(missing)}")
                 for m in missing[:3]:
                     print(f"    - {m}")
             if unexpected:
-                print(f"  Clés inattendues: {len(unexpected)}")
+                print(f"  Cles inattendues: {len(unexpected)}")
 
             pvt_model.eval()
             model = pvt_model
-            print("PVTv2 chargé avec succès")
+            print("PVTv2 charge avec succes")
 
         except ImportError as e:
             print(f"Erreur import Open-Canopy: {e}")
-            print("Vérifiez que le code source est complet.")
+            print("Verifiez que le code source est complet.")
         except Exception as e:
             print(f"Erreur reconstruction PVTv2: {e}")
             import traceback
             traceback.print_exc()
     else:
-        print("ERREUR: Le modèle PVTv2 nécessite le code source Open-Canopy.")
+        print("ERREUR: Le modele PVTv2 necessite le code source Open-Canopy.")
         print(f"  Chemin fourni: {oc_src!r}")
-        print("  Utilisez le paramètre open_canopy_src dans pipeline_aoi_to_chm()")
+        print("  Utilisez le parametre open_canopy_src dans pipeline_aoi_to_chm()")
         print("  Exemple:")
         print("    pipeline_aoi_to_chm(\"aoi.gpkg\", model_name=\"pvtv2\",")
         print("      open_canopy_src=\"C:/Users/.../Open-Canopy\")")
 
 # ======================================================================
-# Inférence
+# Inference
 # ======================================================================
 with torch.no_grad():
     if model is not None:
         output = model(tensor)
 
-        # Le modèle retourne {"out": tensor} (Open-Canopy) ou tensor (SMP)
+        # Le modele retourne {"out": tensor} (Open-Canopy) ou tensor (SMP)
         if isinstance(output, dict):
             pred = output["out"]
         else:
@@ -772,14 +772,14 @@ with torch.no_grad():
 
         pred = pred.squeeze().cpu().numpy()
 
-        # Le modèle prédit en mètres (targets = dm / 10)
+        # Le modele predit en metres (targets = dm / 10)
         pred = np.clip(pred, 0, 50)
         pred = np.round(pred, 1)
 
-        print(f"CHM prédit: min={pred.min():.1f}m, max={pred.max():.1f}m, "
+        print(f"CHM predit: min={pred.min():.1f}m, max={pred.max():.1f}m, "
               f"mean={pred.mean():.1f}m")
     else:
-        print("ATTENTION: Modèle non chargé, fallback estimation NDVI-based")
+        print("ATTENTION: Modele non charge, fallback estimation NDVI-based")
         img = tensor.squeeze().numpy()
         if num_bands >= 4:
             pir = img[3]
@@ -791,14 +791,20 @@ with torch.no_grad():
             pred = np.clip(greenness * 20, 0, 40)
 
 # ======================================================================
-# Sauvegarder le résultat
+# Sauvegarder le resultat
 # ======================================================================
 profile.update(count=1, dtype="float32", compress="lzw")
-with rasterio.open("%s", "w", **profile) as dst:
+with rasterio.open("__OUTPUT_PATH__", "w", **profile) as dst:
     dst.write(pred.astype(np.float32), 1)
 
-print("Prédiction sauvegardée")
-', tmp_in_py, model_path_py, model_name, oc_src_py, tmp_out_py)
+print("Prediction sauvegardee")
+'
+  # Substitution des placeholders (evite sprintf et ses limites)
+  py_code <- gsub("__INPUT_PATH__", tmp_in_py, py_code, fixed = TRUE)
+  py_code <- gsub("__MODEL_PATH__", model_path_py, py_code, fixed = TRUE)
+  py_code <- gsub("__MODEL_NAME__", model_name, py_code, fixed = TRUE)
+  py_code <- gsub("__OC_SRC__", oc_src_py, py_code, fixed = TRUE)
+  py_code <- gsub("__OUTPUT_PATH__", tmp_out_py, py_code, fixed = TRUE)
 
   tryCatch({
     py_run_string(py_code)

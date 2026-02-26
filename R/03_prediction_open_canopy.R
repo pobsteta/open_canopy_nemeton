@@ -198,35 +198,37 @@ run_inference_python <- function(tile_path, model_path, output_path = NULL) {
                               paste0("pred_", basename(tile_path)))
   }
 
-  # Script Python inline pour l'inférence
-  py_code <- sprintf('
+  # Script Python inline pour l'inference
+  py_code <- '
 import torch
 import numpy as np
 import rasterio
 
-# Charger le modèle
-checkpoint = torch.load("%s", map_location="cpu", weights_only=False)
+# Charger le modele
+checkpoint = torch.load("__MODEL_PATH__", map_location="cpu", weights_only=False)
 
 # Charger l image
-with rasterio.open("%s") as src:
+with rasterio.open("__TILE_PATH__") as src:
     image = src.read().astype(np.float32)
     profile = src.profile.copy()
 
-# Préparer pour le modèle (batch dim)
+# Preparer pour le modele (batch dim)
 tensor = torch.from_numpy(image).unsqueeze(0)
 
-# Inférence
+# Inference
 model = checkpoint.get("model", checkpoint.get("state_dict", None))
 if model is not None:
-    print("Modèle chargé, inférence en cours...")
+    print("Modele charge, inference en cours...")
 else:
     print("Structure du checkpoint:")
     print(list(checkpoint.keys()))
 
-# Sauvegarder le résultat
+# Sauvegarder le resultat
 profile.update(count=1, dtype="float32")
-# Note: adapter selon la sortie réelle du modèle
-', model_path, tile_path)
+# Note: adapter selon la sortie reelle du modele
+'
+  py_code <- gsub("__MODEL_PATH__", gsub("\\\\", "/", model_path), py_code, fixed = TRUE)
+  py_code <- gsub("__TILE_PATH__", gsub("\\\\", "/", tile_path), py_code, fixed = TRUE)
 
   tryCatch({
     py_run_string(py_code)
