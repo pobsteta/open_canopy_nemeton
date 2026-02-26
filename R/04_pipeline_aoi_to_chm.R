@@ -1110,6 +1110,79 @@ pipeline_aoi_to_chm <- function(aoi_path,
   dev.off()
   message("PDF:      ", pdf_path)
 
+  # --- Visualisation interactive (RStudio) avec ggplot2 + patchwork ---
+  p_combined <- NULL
+  if (requireNamespace("ggplot2", quietly = TRUE) &&
+      requireNamespace("patchwork", quietly = TRUE) &&
+      requireNamespace("tidyterra", quietly = TRUE)) {
+
+    library(ggplot2)
+    library(patchwork)
+    library(tidyterra)
+
+    # Panel 1 : Ortho RVB
+    p_rvb <- ggplot() +
+      geom_spatraster_rgb(data = ortho$rvb, r = 1, g = 2, b = 3,
+                          max_col_value = 255) +
+      labs(title = sprintf("Ortho RVB 0.20m (%s)", label_ortho)) +
+      theme_minimal() +
+      theme(axis.text = element_text(size = 6),
+            plot.title = element_text(size = 10, face = "bold"))
+
+    # Panel 2 : Ortho IRC fausses couleurs
+    p_irc <- ggplot() +
+      geom_spatraster_rgb(data = ortho$irc, r = 1, g = 2, b = 3,
+                          max_col_value = 255) +
+      labs(title = sprintf("Ortho IRC 0.20m (%s)", label_irc)) +
+      theme_minimal() +
+      theme(axis.text = element_text(size = 6),
+            plot.title = element_text(size = 10, face = "bold"))
+
+    # Panel 3 : NDVI
+    p_ndvi <- ggplot() +
+      geom_spatraster(data = ndvi) +
+      scale_fill_gradientn(
+        colours = c("#d73027", "#fc8d59", "#fee08b", "#ffffbf",
+                    "#d9ef8b", "#91cf60", "#1a9850", "#006837"),
+        limits = c(-0.2, 1), na.value = "transparent",
+        name = "NDVI"
+      ) +
+      labs(title = "NDVI (depuis IRC)") +
+      theme_minimal() +
+      theme(axis.text = element_text(size = 6),
+            plot.title = element_text(size = 10, face = "bold"))
+
+    # Panel 4 : CHM
+    p_chm <- ggplot() +
+      geom_spatraster(data = chm) +
+      scale_fill_gradientn(
+        colours = c("#f7fcb9", "#addd8e", "#41ab5d", "#006837", "#004529"),
+        na.value = "transparent",
+        name = "Hauteur (m)"
+      ) +
+      labs(title = paste("CHM", model_name)) +
+      theme_minimal() +
+      theme(axis.text = element_text(size = 6),
+            plot.title = element_text(size = 10, face = "bold"))
+
+    p_combined <- (p_rvb | p_irc) / (p_ndvi | p_chm) +
+      plot_annotation(
+        title = "Pipeline Open-Canopy : ortho IGN \u2192 CHM",
+        subtitle = sprintf("AOI: %s | CHM: min=%.1fm, max=%.1fm, moy=%.1fm",
+                           basename(aoi_path),
+                           min(values(chm, na.rm = TRUE)),
+                           max(values(chm, na.rm = TRUE)),
+                           mean(values(chm, na.rm = TRUE))),
+        theme = theme(
+          plot.title = element_text(size = 14, face = "bold"),
+          plot.subtitle = element_text(size = 10, color = "grey40")
+        )
+      )
+
+    print(p_combined)
+    message("Plot patchwork affich\u00e9 dans RStudio")
+  }
+
   # --- Résumé ---
   dt <- round(difftime(Sys.time(), t0, units = "mins"), 1)
   chm_vals <- values(chm, na.rm = TRUE)
@@ -1133,6 +1206,7 @@ pipeline_aoi_to_chm <- function(aoi_path,
     ndvi      = ndvi,
     chm_1_5m  = chm,
     chm_0_2m  = chm_hr,
+    plot      = p_combined,
     output_dir = output_dir
   ))
 }
