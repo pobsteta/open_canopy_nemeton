@@ -557,9 +557,10 @@ predict_tile <- function(tile, model_path, model_name = "unet",
                           open_canopy_src = NULL) {
   library(reticulate)
 
-  # Sauvegarder la tuile en fichier temporaire
-  tmp_in <- tempfile(fileext = ".tif")
-  tmp_out <- tempfile(fileext = ".tif")
+  # Sauvegarder la tuile en fichier temporaire (chemin long pour Windows)
+  tmp_dir <- normalizePath(tempdir(), winslash = "/")
+  tmp_in <- tempfile(tmpdir = tmp_dir, fileext = ".tif")
+  tmp_out <- tempfile(tmpdir = tmp_dir, fileext = ".tif")
   writeRaster(tile, tmp_in, overwrite = TRUE)
 
   # Normaliser les chemins pour Python sous Windows
@@ -990,6 +991,13 @@ pipeline_aoi_to_chm <- function(aoi_path,
                                   millesime_irc = MILLESIME_IRC) {
   dir_create(output_dir)
   t0 <- Sys.time()
+
+  # Contournement Windows : les chemins courts 8.3 (ex. PASCAL~1.OBS)
+  # provoquent des erreurs terra/GDAL. On normalise le tempdir.
+  if (.Platform$OS.type == "windows") {
+    long_tmpdir <- normalizePath(tempdir(), winslash = "/")
+    terraOptions(tempdir = long_tmpdir)
+  }
 
   message("##############################################################")
   message("#  Pipeline Open-Canopy : AOI → Ortho IGN → CHM prédit       #")
