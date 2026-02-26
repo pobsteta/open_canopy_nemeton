@@ -433,8 +433,28 @@ download_ign_ortho_pair <- function(bbox, res_m = RES_IGN,
   message(sprintf("Millésime RVB: %s (couche: %s)", label_ortho, layer_ortho))
   message(sprintf("Millésime IRC: %s (couche: %s)", label_irc, layer_irc))
 
-  rvb_path <- download_ign_wms(bbox, layer = layer_ortho, res_m = res_m)
-  irc_path <- download_ign_wms(bbox, layer = layer_irc, res_m = res_m)
+  rvb_path <- tryCatch(
+    download_ign_wms(bbox, layer = layer_ortho, res_m = res_m),
+    error = function(e) {
+      if (!is.null(millesime_ortho)) {
+        message(sprintf("  Couche %s indisponible, fallback sur %s",
+                        layer_ortho, IGN_LAYER_ORTHO))
+        layer_ortho <<- IGN_LAYER_ORTHO
+        download_ign_wms(bbox, layer = IGN_LAYER_ORTHO, res_m = res_m)
+      } else stop(e)
+    }
+  )
+  irc_path <- tryCatch(
+    download_ign_wms(bbox, layer = layer_irc, res_m = res_m),
+    error = function(e) {
+      if (!is.null(millesime_irc)) {
+        message(sprintf("  Couche %s indisponible, fallback sur %s",
+                        layer_irc, IGN_LAYER_IRC))
+        layer_irc <<- IGN_LAYER_IRC
+        download_ign_wms(bbox, layer = IGN_LAYER_IRC, res_m = res_m)
+      } else stop(e)
+    }
+  )
 
   return(list(rvb = rvb_path, irc = irc_path,
               millesime_ortho = millesime_ortho,

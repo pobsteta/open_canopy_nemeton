@@ -305,14 +305,38 @@ download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN,
 
   # --- RVB ---
   message("\n--- Ortho RVB ---")
-  rvb <- download_ign_tiled(bbox, layer = layer_ortho, res_m = res_m,
-                             output_dir = output_dir, prefix = "rvb")
+  rvb <- tryCatch(
+    download_ign_tiled(bbox, layer = layer_ortho, res_m = res_m,
+                       output_dir = output_dir, prefix = "rvb"),
+    error = function(e) {
+      if (!is.null(millesime_ortho)) {
+        message(sprintf("  Couche %s indisponible, fallback sur %s",
+                        layer_ortho, IGN_LAYER_ORTHO))
+        layer_ortho <<- IGN_LAYER_ORTHO
+        label_ortho <<- "plus récent (fallback)"
+        download_ign_tiled(bbox, layer = IGN_LAYER_ORTHO, res_m = res_m,
+                           output_dir = output_dir, prefix = "rvb")
+      } else stop(e)
+    }
+  )
   names(rvb)[1:min(3, nlyr(rvb))] <- c("Rouge", "Vert", "Bleu")[1:min(3, nlyr(rvb))]
 
   # --- IRC ---
   message("\n--- Ortho IRC ---")
-  irc <- download_ign_tiled(bbox, layer = layer_irc, res_m = res_m,
-                             output_dir = output_dir, prefix = "irc")
+  irc <- tryCatch(
+    download_ign_tiled(bbox, layer = layer_irc, res_m = res_m,
+                       output_dir = output_dir, prefix = "irc"),
+    error = function(e) {
+      if (!is.null(millesime_irc)) {
+        message(sprintf("  Couche %s indisponible, fallback sur %s",
+                        layer_irc, IGN_LAYER_IRC))
+        layer_irc <<- IGN_LAYER_IRC
+        label_irc <<- "plus récent (fallback)"
+        download_ign_tiled(bbox, layer = IGN_LAYER_IRC, res_m = res_m,
+                           output_dir = output_dir, prefix = "irc")
+      } else stop(e)
+    }
+  )
   names(irc)[1:min(3, nlyr(irc))] <- c("PIR", "Rouge", "Vert")[1:min(3, nlyr(irc))]
 
   # Découper aux limites exactes de l'AOI
