@@ -34,7 +34,33 @@ library(curl)
 # --- IGN Géoplateforme ---
 IGN_WMS_URL      <- "https://data.geopf.fr/wms-r"
 IGN_LAYER_ORTHO  <- "ORTHOIMAGERY.ORTHOPHOTOS"
-IGN_LAYER_IRC    <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC-EXPRESS.2024"
+IGN_LAYER_IRC    <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC"
+
+# --- Millésime (NULL = couche la plus récente disponible) ---
+# Exemples : "2024", "2023", "2021"...
+# Ortho RVB → couche ORTHOIMAGERY.ORTHOPHOTOS{année}
+# IRC       → couche ORTHOIMAGERY.ORTHOPHOTOS.IRC.{année}
+MILLESIME_ORTHO <- NULL
+MILLESIME_IRC   <- NULL
+
+#' Construire le nom de couche WMS en fonction du millésime
+#'
+#' @param type "ortho" ou "irc"
+#' @param millesime Année (chaîne ou numérique), NULL pour la couche courante
+#' @return Nom de couche WMS IGN
+ign_layer_name <- function(type = c("ortho", "irc"), millesime = NULL) {
+  type <- match.arg(type)
+  if (is.null(millesime)) {
+    if (type == "ortho") return(IGN_LAYER_ORTHO)
+    else                 return(IGN_LAYER_IRC)
+  }
+  millesime <- as.character(millesime)
+  if (type == "ortho") {
+    return(paste0("ORTHOIMAGERY.ORTHOPHOTOS", millesime))
+  } else {
+    return(paste0("ORTHOIMAGERY.ORTHOPHOTOS.IRC.", millesime))
+  }
+}
 
 # --- Résolutions ---
 RES_IGN  <- 0.2   # BD ORTHO® IGN
@@ -112,13 +138,13 @@ download_wms_tile <- function(bbox, layer, res_m = RES_IGN, dest_file) {
   width  <- round((xmax - xmin) / res_m)
   height <- round((ymax - ymin) / res_m)
 
-  # WMS 1.3.0 avec CRS EPSG:2154 : BBOX = ymin,xmin,ymax,xmax
+  # WMS 1.3.0 avec CRS EPSG:2154 : BBOX = xmin,ymin,xmax,ymax (easting, northing)
   wms_url <- paste0(
     IGN_WMS_URL, "?",
     "SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap",
     "&LAYERS=", layer,
     "&CRS=EPSG:2154",
-    "&BBOX=", paste(ymin, xmin, ymax, xmax, sep = ","),
+    "&BBOX=", paste(xmin, ymin, xmax, ymax, sep = ","),
     "&WIDTH=", width,
     "&HEIGHT=", height,
     "&FORMAT=image/geotiff",
@@ -228,28 +254,89 @@ download_ign_tiled <- function(bbox, layer, res_m = RES_IGN,
 #' @param aoi sf object (AOI en Lambert-93)
 #' @param output_dir Répertoire de sortie
 #' @param res_m Résolution en mètres
-#' @return Liste avec rvb (SpatRaster) et irc (SpatRaster)
-download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN) {
+#' @param millesime_ortho Millésime ortho RVB (NULL = plus récent)
+#' @param millesime_irc Millésime IRC (NULL = plus récent)
+#' @return Liste avec rvb, irc (SpatRaster) et millésimes utilisés
+download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN,
+                                    millesime_ortho = MILLESIME_ORTHO,
+                                    millesime_irc = MILLESIME_IRC) {
   dir_create(output_dir)
 
+  # Résoudre les couches WMS selon le millésime
+  layer_ortho <- ign_layer_name("ortho", millesime_ortho)
+  layer_irc   <- ign_layer_name("irc",   millesime_irc)
+  label_ortho <- if (is.null(millesime_ortho)) "plus récent" else millesime_ortho
+  label_irc   <- if (is.null(millesime_irc))   "plus récent" else millesime_irc
+
+  # Vérifier si les fichiers existent déjà (cache)
+  rvb_path <- file.path(output_dir, "ortho_rvb.tif")
+  irc_path <- file.path(output_dir, "ortho_irc.tif")
+
+  if (file.exists(rvb_path) && file.exists(irc_path)) {
+    message("\n=== Ortho IGN déjà présentes (cache) ===")
+    message(sprintf("  RVB: %s", rvb_path))
+    message(sprintf("  IRC: %s", irc_path))
+    message("Réutilisation des fichiers existants (supprimez-les pour forcer le re-téléchargement).")
+
+    rvb <- rast(rvb_path)
+    irc <- rast(irc_path)
+    # Restaurer les noms de bandes (perdus lors de l'écriture GeoTIFF)
+    names(rvb)[1:min(3, nlyr(rvb))] <- c("Rouge", "Vert", "Bleu")[1:min(3, nlyr(rvb))]
+    names(irc)[1:min(3, nlyr(irc))] <- c("PIR", "Rouge", "Vert")[1:min(3, nlyr(irc))]
+
+    return(list(rvb = rvb, irc = irc,
+                rvb_path = rvb_path, irc_path = irc_path,
+                millesime_ortho = millesime_ortho,
+                millesime_irc = millesime_irc,
+                layer_ortho = layer_ortho,
+                layer_irc = layer_irc))
+  }
+
   bbox <- as.numeric(st_bbox(st_union(aoi)))
+
   message(sprintf("\n=== Téléchargement ortho IGN pour l'AOI ==="))
   message(sprintf("Emprise: %.0f, %.0f - %.0f, %.0f (Lambert-93)",
                    bbox[1], bbox[2], bbox[3], bbox[4]))
   message(sprintf("Taille: %.0f x %.0f m (%.2f ha)",
                    bbox[3] - bbox[1], bbox[4] - bbox[2],
                    (bbox[3] - bbox[1]) * (bbox[4] - bbox[2]) / 10000))
+  message(sprintf("Millésime RVB: %s (couche: %s)", label_ortho, layer_ortho))
+  message(sprintf("Millésime IRC: %s (couche: %s)", label_irc, layer_irc))
 
   # --- RVB ---
   message("\n--- Ortho RVB ---")
-  rvb <- download_ign_tiled(bbox, layer = IGN_LAYER_ORTHO, res_m = res_m,
-                             output_dir = output_dir, prefix = "rvb")
+  rvb <- tryCatch(
+    download_ign_tiled(bbox, layer = layer_ortho, res_m = res_m,
+                       output_dir = output_dir, prefix = "rvb"),
+    error = function(e) {
+      if (!is.null(millesime_ortho)) {
+        message(sprintf("  Couche %s indisponible, fallback sur %s",
+                        layer_ortho, IGN_LAYER_ORTHO))
+        layer_ortho <<- IGN_LAYER_ORTHO
+        label_ortho <<- "plus récent (fallback)"
+        download_ign_tiled(bbox, layer = IGN_LAYER_ORTHO, res_m = res_m,
+                           output_dir = output_dir, prefix = "rvb")
+      } else stop(e)
+    }
+  )
   names(rvb)[1:min(3, nlyr(rvb))] <- c("Rouge", "Vert", "Bleu")[1:min(3, nlyr(rvb))]
 
   # --- IRC ---
   message("\n--- Ortho IRC ---")
-  irc <- download_ign_tiled(bbox, layer = IGN_LAYER_IRC, res_m = res_m,
-                             output_dir = output_dir, prefix = "irc")
+  irc <- tryCatch(
+    download_ign_tiled(bbox, layer = layer_irc, res_m = res_m,
+                       output_dir = output_dir, prefix = "irc"),
+    error = function(e) {
+      if (!is.null(millesime_irc)) {
+        message(sprintf("  Couche %s indisponible, fallback sur %s",
+                        layer_irc, IGN_LAYER_IRC))
+        layer_irc <<- IGN_LAYER_IRC
+        label_irc <<- "plus récent (fallback)"
+        download_ign_tiled(bbox, layer = IGN_LAYER_IRC, res_m = res_m,
+                           output_dir = output_dir, prefix = "irc")
+      } else stop(e)
+    }
+  )
   names(irc)[1:min(3, nlyr(irc))] <- c("PIR", "Rouge", "Vert")[1:min(3, nlyr(irc))]
 
   # Découper aux limites exactes de l'AOI
@@ -258,10 +345,16 @@ download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN) {
   irc <- crop(irc, aoi_vect)
 
   # Sauvegarder les mosaïques finales
-  rvb_path <- file.path(output_dir, "ortho_rvb.tif")
-  irc_path <- file.path(output_dir, "ortho_irc.tif")
   writeRaster(rvb, rvb_path, overwrite = TRUE)
   writeRaster(irc, irc_path, overwrite = TRUE)
+
+  # Recharger depuis les fichiers consolidés pour que les SpatRaster
+  # pointent vers ortho_rvb.tif / ortho_irc.tif (et non les tuiles)
+  rvb <- rast(rvb_path)
+  irc <- rast(irc_path)
+  # Restaurer les noms de bandes (perdus lors de l'écriture GeoTIFF)
+  names(rvb)[1:min(3, nlyr(rvb))] <- c("Rouge", "Vert", "Bleu")[1:min(3, nlyr(rvb))]
+  names(irc)[1:min(3, nlyr(irc))] <- c("PIR", "Rouge", "Vert")[1:min(3, nlyr(irc))]
 
   message(sprintf("\nRVB sauvegardé: %s (%d x %d px)", rvb_path, ncol(rvb), nrow(rvb)))
   message(sprintf("IRC sauvegardé: %s (%d x %d px)", irc_path, ncol(irc), nrow(irc)))
@@ -271,7 +364,11 @@ download_ortho_for_aoi <- function(aoi, output_dir, res_m = RES_IGN) {
   if (length(tile_files) > 0) file_delete(tile_files)
 
   return(list(rvb = rvb, irc = irc,
-              rvb_path = rvb_path, irc_path = irc_path))
+              rvb_path = rvb_path, irc_path = irc_path,
+              millesime_ortho = millesime_ortho,
+              millesime_irc = millesime_irc,
+              layer_ortho = layer_ortho,
+              layer_irc = layer_irc))
 }
 
 # ==============================================================================
@@ -356,23 +453,38 @@ download_model <- function(model_name = "unet") {
   # Lister dynamiquement les fichiers .ckpt dans pretrained_models/
   tryCatch({
     api <- hf_hub$HfApi()
-    tree <- api$list_repo_tree(
-      HF_REPO_ID,
-      path_in_repo = "pretrained_models",
-      repo_type = "dataset"
-    )
 
-    # Extraire les noms de fichiers .ckpt
-    # Convertir le générateur Python en liste R
-    items <- tryCatch(
-      reticulate::iterate(tree),
-      error = function(e) as.list(tree)
-    )
+    # Utiliser list_repo_files (retourne des chaînes) — plus robuste que list_repo_tree
+    all_files <- tryCatch({
+      files <- api$list_repo_files(
+        HF_REPO_ID,
+        repo_type = "dataset"
+      )
+      reticulate::iterate(files)
+    }, error = function(e) {
+      # Fallback : list_repo_tree avec gestion des attributs
+      tree <- api$list_repo_tree(
+        HF_REPO_ID,
+        path_in_repo = "pretrained_models",
+        repo_type = "dataset"
+      )
+      items <- tryCatch(reticulate::iterate(tree), error = function(e2) as.list(tree))
+      paths <- character(0)
+      for (item in items) {
+        p <- tryCatch(item$path, error = function(e3)
+          tryCatch(item$rfilename, error = function(e4)
+            tryCatch(as.character(item), error = function(e5) "")))
+        if (nzchar(p)) paths <- c(paths, p)
+      }
+      paths
+    })
+
+    # Filtrer les .ckpt dans pretrained_models/
     ckpt_files <- character(0)
-    for (item in items) {
-      fname <- item$rfilename
-      if (!is.null(fname) && grepl("\\.ckpt$", fname)) {
-        ckpt_files <- c(ckpt_files, fname)
+    for (f in all_files) {
+      fname <- as.character(f)
+      if (grepl("^pretrained_models/", fname) && grepl("\\.ckpt$", fname)) {
+        ckpt_files <- c(ckpt_files, basename(fname))
       }
     }
 
@@ -401,7 +513,7 @@ download_model <- function(model_name = "unet") {
     message("Téléchargement: ", target_file)
     local_path <- hf_hub$hf_hub_download(
       repo_id  = HF_REPO_ID,
-      filename = target_file,
+      filename = paste0("pretrained_models/", target_file),
       repo_type = "dataset"
     )
     message("Modèle: ", local_path)
@@ -469,9 +581,10 @@ predict_tile <- function(tile, model_path, model_name = "unet",
                           open_canopy_src = NULL) {
   library(reticulate)
 
-  # Sauvegarder la tuile en fichier temporaire
-  tmp_in <- tempfile(fileext = ".tif")
-  tmp_out <- tempfile(fileext = ".tif")
+  # Sauvegarder la tuile en fichier temporaire (chemin long pour Windows)
+  tmp_dir <- normalizePath(tempdir(), winslash = "/")
+  tmp_in <- tempfile(tmpdir = tmp_dir, fileext = ".tif")
+  tmp_out <- tempfile(tmpdir = tmp_dir, fileext = ".tif")
   writeRaster(tile, tmp_in, overwrite = TRUE)
 
   # Normaliser les chemins pour Python sous Windows
@@ -485,7 +598,7 @@ predict_tile <- function(tile, model_path, model_name = "unet",
     oc_src_py <- gsub("\\\\", "/", open_canopy_src)
   }
 
-  py_code <- sprintf('
+  py_code <- '
 import sys
 import os
 import torch
@@ -496,12 +609,12 @@ import rasterio
 # ======================================================================
 # Charger l image 4 bandes (R, G, B, PIR)
 # ======================================================================
-with rasterio.open("%s") as src:
+with rasterio.open("__INPUT_PATH__") as src:
     image = src.read().astype(np.float32)  # (C, H, W)
     profile = src.profile.copy()
 
 num_bands, H, W = image.shape
-print(f"Image chargée: {num_bands} bandes, {H}x{W} px")
+print(f"Image chargee: {num_bands} bandes, {H}x{W} px")
 
 # Open-Canopy utilise mean=0, std=1 : pas de normalisation
 tensor = torch.from_numpy(image).unsqueeze(0)  # (1, C, H, W)
@@ -511,19 +624,72 @@ print(f"Tensor: shape={tuple(tensor.shape)}, "
 # ======================================================================
 # Charger le checkpoint PyTorch Lightning
 # ======================================================================
-ckpt_path = "%s"
-checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+ckpt_path = "__MODEL_PATH__"
+oc_src = "__OC_SRC__"
 
-print(f"Checkpoint clés: {list(checkpoint.keys())}")
+# Ajouter Open-Canopy au path avant chargement (le checkpoint peut
+# referencer des classes du module src)
+if oc_src and os.path.isdir(oc_src):
+    if oc_src not in sys.path:
+        sys.path.insert(0, oc_src)
+        print(f"Open-Canopy source ajoute au path: {oc_src}")
+
+import types as _types
+
+class _Dummy:
+    """Classe factice pour depickling des references manquantes."""
+    def __init__(self, *a, **kw): pass
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+
+class _MockMod(_types.ModuleType):
+    """Module factice dont les attributs retournent _Dummy."""
+    def __getattr__(self, name):
+        return _Dummy
+
+class _SrcFinder:
+    """Import hook pour simuler le package src (Open-Canopy)."""
+    def find_module(self, fullname, path=None):
+        if fullname == "src" or fullname.startswith("src."):
+            return self
+        return None
+    def load_module(self, fullname):
+        if fullname in sys.modules:
+            return sys.modules[fullname]
+        mod = _MockMod(fullname)
+        mod.__loader__ = self
+        mod.__path__ = []
+        mod.__package__ = fullname
+        sys.modules[fullname] = mod
+        return mod
+
+try:
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+except (ModuleNotFoundError, ImportError) as e:
+    print(f"  Chargement direct echoue: {e}")
+    print("  Simulation des modules manquants pour le depickling...")
+    _finder = _SrcFinder()
+    sys.meta_path.insert(0, _finder)
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    finally:
+        sys.meta_path.remove(_finder)
+        for _k in list(sys.modules):
+            if _k == "src" or _k.startswith("src."):
+                del sys.modules[_k]
+    print("  Checkpoint charge avec modules simules")
+
+print(f"Checkpoint cles: {list(checkpoint.keys())}")
 
 state_dict = checkpoint.get("state_dict", checkpoint)
 keys = list(state_dict.keys())
-print(f"State dict: {len(keys)} paramètres")
-print(f"  Premières clés: {keys[:5]}")
+print(f"State dict: {len(keys)} parametres")
+print(f"  Premieres cles: {keys[:5]}")
 
 # ======================================================================
 # Fonction set_first_layer (reproduction du code Open-Canopy)
-# Adapte la première couche conv de 3 → N canaux
+# Adapte la premiere couche conv de 3 a N canaux
 # ======================================================================
 def set_first_layer(model, n_channels):
     if n_channels == 3:
@@ -553,10 +719,10 @@ def set_first_layer(model, n_channels):
         module.in_channels = n_channels
 
 # ======================================================================
-# Nettoyage des clés du state_dict
+# Nettoyage des cles du state_dict
 # ======================================================================
 def clean_state_dict(state_dict, prefix_to_strip):
-    """Enlève un préfixe des clés du state_dict."""
+    """Enleve un prefixe des cles du state_dict."""
     clean = {}
     for k, v in state_dict.items():
         new_k = k
@@ -568,18 +734,17 @@ def clean_state_dict(state_dict, prefix_to_strip):
     return clean
 
 # ======================================================================
-# Reconstruire le modèle selon l architecture
+# Reconstruire le modele selon l architecture
 # ======================================================================
-model_name = "%s"
-oc_src = "%s"
+model_name = "__MODEL_NAME__"
 model = None
 
-# Détecter le type de modèle depuis les clés du checkpoint
+# Detecter le type de modele depuis les cles du checkpoint
 has_seg_model = any("seg_model" in k for k in keys)
 has_timm_model = any("net.model." in k for k in keys)
 has_seg_head = any("net.seg_head." in k for k in keys)
 
-print(f"Détection: seg_model={has_seg_model}, timm_model={has_timm_model}, "
+print(f"Detection: seg_model={has_seg_model}, timm_model={has_timm_model}, "
       f"seg_head={has_seg_head}")
 
 # ======================================================================
@@ -588,7 +753,7 @@ print(f"Détection: seg_model={has_seg_model}, timm_model={has_timm_model}, "
 if has_seg_model or (model_name == "unet" and not has_timm_model):
     import segmentation_models_pytorch as smp
 
-    print("=== Reconstruction: SMP UNet (ResNet34, 4ch → 1 classe) ===")
+    print("=== Reconstruction: SMP UNet (ResNet34, 4ch, 1 classe) ===")
 
     seg_model = smp.create_model(
         arch="unet",
@@ -599,40 +764,35 @@ if has_seg_model or (model_name == "unet" and not has_timm_model):
     )
     set_first_layer(seg_model.encoder, num_bands)
 
-    # Clés Lightning : "net.seg_model.encoder.conv1.weight" etc.
+    # Cles Lightning : "net.seg_model.encoder.conv1.weight" etc.
     clean_dict = clean_state_dict(state_dict,
         ["net.seg_model.", "model.seg_model.", "net.", "model."])
 
     missing, unexpected = seg_model.load_state_dict(clean_dict, strict=False)
     if missing:
-        print(f"  Clés manquantes: {len(missing)}")
+        print(f"  Cles manquantes: {len(missing)}")
         for m in missing[:3]:
             print(f"    - {m}")
     if unexpected:
-        print(f"  Clés inattendues: {len(unexpected)}")
+        print(f"  Cles inattendues: {len(unexpected)}")
 
     seg_model.eval()
     # Wrapper pour retourner un tensor (pas un dict)
     model = seg_model
-    print("UNet SMP chargé avec succès")
+    print("UNet SMP charge avec succes")
 
 # ======================================================================
 # PVTv2 (timm + SimpleSegmentationHead)
 # ======================================================================
 elif has_timm_model or has_seg_head or model_name == "pvtv2":
-    print("=== Reconstruction: PVTv2 (timm pvt_v2_b3, 4ch → 1 classe) ===")
+    print("=== Reconstruction: PVTv2 (timm pvt_v2_b3, 4ch, 1 classe) ===")
 
     if oc_src and os.path.isdir(oc_src):
-        # Ajouter le code source Open-Canopy au path Python
-        if oc_src not in sys.path:
-            sys.path.insert(0, oc_src)
-        print(f"Open-Canopy source ajouté: {oc_src}")
-
         try:
             from src.models.components.timmNet import timmNet
-            print("Import timmNet depuis Open-Canopy réussi")
+            print("Import timmNet depuis Open-Canopy reussi")
 
-            # Reconstruire le modèle PVTv2 avec les mêmes paramètres
+            # Reconstruire le modele PVTv2 avec les memes parametres
             # que configs/model/PVTv2_B.yaml + _seg_default.yaml
             pvt_model = timmNet(
                 backbone="pvt_v2_b3.in1k",
@@ -640,49 +800,49 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
                 num_channels=num_bands,
                 pretrained=False,       # pas besoin, on charge le checkpoint
                 pretrained_path=None,
-                img_size=max(H, W),     # taille de l image d entrée
+                img_size=max(H, W),     # taille de l image d entree
                 use_FPN=False,
             )
 
-            # Clés Lightning : "net.model.xxx" et "net.seg_head.xxx"
+            # Cles Lightning : "net.model.xxx" et "net.seg_head.xxx"
             clean_dict = clean_state_dict(state_dict, ["net.", "model."])
 
             missing, unexpected = pvt_model.load_state_dict(
                 clean_dict, strict=False)
             if missing:
-                print(f"  Clés manquantes: {len(missing)}")
+                print(f"  Cles manquantes: {len(missing)}")
                 for m in missing[:3]:
                     print(f"    - {m}")
             if unexpected:
-                print(f"  Clés inattendues: {len(unexpected)}")
+                print(f"  Cles inattendues: {len(unexpected)}")
 
             pvt_model.eval()
             model = pvt_model
-            print("PVTv2 chargé avec succès")
+            print("PVTv2 charge avec succes")
 
         except ImportError as e:
             print(f"Erreur import Open-Canopy: {e}")
-            print("Vérifiez que le code source est complet.")
+            print("Verifiez que le code source est complet.")
         except Exception as e:
             print(f"Erreur reconstruction PVTv2: {e}")
             import traceback
             traceback.print_exc()
     else:
-        print("ERREUR: Le modèle PVTv2 nécessite le code source Open-Canopy.")
+        print("ERREUR: Le modele PVTv2 necessite le code source Open-Canopy.")
         print(f"  Chemin fourni: {oc_src!r}")
-        print("  Utilisez le paramètre open_canopy_src dans pipeline_aoi_to_chm()")
+        print("  Utilisez le parametre open_canopy_src dans pipeline_aoi_to_chm()")
         print("  Exemple:")
-        print("    pipeline_aoi_to_chm(\"aoi.gpkg\", model_name=\"pvtv2\",")
-        print("      open_canopy_src=\"C:/Users/.../Open-Canopy\")")
+        print(\'    pipeline_aoi_to_chm("aoi.gpkg", model_name="pvtv2",\')
+        print(\'      open_canopy_src="C:/Users/.../Open-Canopy")\')
 
 # ======================================================================
-# Inférence
+# Inference
 # ======================================================================
 with torch.no_grad():
     if model is not None:
         output = model(tensor)
 
-        # Le modèle retourne {"out": tensor} (Open-Canopy) ou tensor (SMP)
+        # Le modele retourne {"out": tensor} (Open-Canopy) ou tensor (SMP)
         if isinstance(output, dict):
             pred = output["out"]
         else:
@@ -690,14 +850,14 @@ with torch.no_grad():
 
         pred = pred.squeeze().cpu().numpy()
 
-        # Le modèle prédit en mètres (targets = dm / 10)
+        # Le modele predit en metres (targets = dm / 10)
         pred = np.clip(pred, 0, 50)
         pred = np.round(pred, 1)
 
-        print(f"CHM prédit: min={pred.min():.1f}m, max={pred.max():.1f}m, "
+        print(f"CHM predit: min={pred.min():.1f}m, max={pred.max():.1f}m, "
               f"mean={pred.mean():.1f}m")
     else:
-        print("ATTENTION: Modèle non chargé, fallback estimation NDVI-based")
+        print("ATTENTION: Modele non charge, fallback estimation NDVI-based")
         img = tensor.squeeze().numpy()
         if num_bands >= 4:
             pir = img[3]
@@ -709,19 +869,28 @@ with torch.no_grad():
             pred = np.clip(greenness * 20, 0, 40)
 
 # ======================================================================
-# Sauvegarder le résultat
+# Sauvegarder le resultat
 # ======================================================================
 profile.update(count=1, dtype="float32", compress="lzw")
-with rasterio.open("%s", "w", **profile) as dst:
+with rasterio.open("__OUTPUT_PATH__", "w", **profile) as dst:
     dst.write(pred.astype(np.float32), 1)
 
-print("Prédiction sauvegardée")
-', tmp_in_py, model_path_py, model_name, oc_src_py, tmp_out_py)
+print("Prediction sauvegardee")
+'
+  # Substitution des placeholders (evite sprintf et ses limites)
+  py_code <- gsub("__INPUT_PATH__", tmp_in_py, py_code, fixed = TRUE)
+  py_code <- gsub("__MODEL_PATH__", model_path_py, py_code, fixed = TRUE)
+  py_code <- gsub("__MODEL_NAME__", model_name, py_code, fixed = TRUE)
+  py_code <- gsub("__OC_SRC__", oc_src_py, py_code, fixed = TRUE)
+  py_code <- gsub("__OUTPUT_PATH__", tmp_out_py, py_code, fixed = TRUE)
 
   tryCatch({
     py_run_string(py_code)
-    pred <- rast(tmp_out)
+    pred_disk <- rast(tmp_out)
+    # Forcer la lecture en mémoire AVANT de supprimer le fichier temp
+    pred <- setValues(rast(pred_disk), values(pred_disk))
     names(pred) <- "chm_predicted"
+    rm(pred_disk)
     return(pred)
   }, error = function(e) {
     warning("Erreur inférence: ", e$message)
@@ -833,15 +1002,26 @@ run_inference <- function(rvb, irc, model_path, model_name = "unet",
 #' @param open_canopy_src Chemin vers le code source Open-Canopy (nécessaire
 #'   pour PVTv2, auto-détecté sinon)
 #' @param res_m Résolution de téléchargement IGN (0.2m par défaut)
+#' @param millesime_ortho Millésime ortho RVB (NULL = plus récent)
+#' @param millesime_irc Millésime IRC (NULL = plus récent)
 #' @return Liste avec tous les résultats
 pipeline_aoi_to_chm <- function(aoi_path,
                                   output_dir = file.path(getwd(), "outputs"),
                                   model_name = "unet",
                                   model_path = NULL,
                                   open_canopy_src = NULL,
-                                  res_m = RES_IGN) {
+                                  res_m = RES_IGN,
+                                  millesime_ortho = MILLESIME_ORTHO,
+                                  millesime_irc = MILLESIME_IRC) {
   dir_create(output_dir)
   t0 <- Sys.time()
+
+  # Contournement Windows : les chemins courts 8.3 (ex. PASCAL~1.OBS)
+  # provoquent des erreurs terra/GDAL. On normalise le tempdir.
+  if (.Platform$OS.type == "windows") {
+    long_tmpdir <- normalizePath(tempdir(), winslash = "/")
+    terraOptions(tempdir = long_tmpdir)
+  }
 
   message("##############################################################")
   message("#  Pipeline Open-Canopy : AOI → Ortho IGN → CHM prédit       #")
@@ -853,7 +1033,9 @@ pipeline_aoi_to_chm <- function(aoi_path,
 
   # --- Étape 2 : Télécharger les ortho IGN ---
   message("\n>>> ÉTAPE 2/5 : Téléchargement des ortho IGN (RVB + IRC)")
-  ortho <- download_ortho_for_aoi(aoi, output_dir = output_dir, res_m = res_m)
+  ortho <- download_ortho_for_aoi(aoi, output_dir = output_dir, res_m = res_m,
+                                   millesime_ortho = millesime_ortho,
+                                   millesime_irc = millesime_irc)
 
   # --- Étape 3 : Configurer Python ---
   message("\n>>> ÉTAPE 3/5 : Configuration Python + téléchargement modèle")
@@ -902,20 +1084,19 @@ pipeline_aoi_to_chm <- function(aoi_path,
 
   # CHM à la résolution du modèle (1.5m)
   chm_path <- file.path(output_dir, "chm_predicted_1_5m.tif")
-  writeRaster(chm, chm_path, overwrite = TRUE,
-              gdal = c("COMPRESS=LZW"))
+  if (file.exists(chm_path)) file.remove(chm_path)
+  writeRaster(chm, chm_path, gdal = c("COMPRESS=LZW"))
   message("CHM 1.5m: ", chm_path)
 
   # Suréchantillonner le CHM vers la résolution IGN (0.20m)
   message("Suréchantillonnage CHM vers 0.20m...")
   disagg_factor <- round(RES_SPOT / RES_IGN)
-  chm_hr <- disagg(chm, fact = disagg_factor, method = "bilinear")
-  # Découper à l'emprise de l'AOI
-  chm_hr <- crop(chm_hr, vect(st_union(aoi)))
-
   chm_hr_path <- file.path(output_dir, "chm_predicted_0_2m.tif")
-  writeRaster(chm_hr, chm_hr_path, overwrite = TRUE,
-              gdal = c("COMPRESS=LZW"))
+  if (file.exists(chm_hr_path)) file.remove(chm_hr_path)
+  chm_hr <- disagg(chm, fact = disagg_factor, method = "bilinear")
+  chm_hr <- crop(chm_hr, vect(st_union(aoi)),
+                 filename = chm_hr_path, overwrite = TRUE,
+                 gdal = c("COMPRESS=LZW"))
   message("CHM 0.2m: ", chm_hr_path)
 
   # --- NDVI si IRC disponible ---
@@ -924,6 +1105,7 @@ pipeline_aoi_to_chm <- function(aoi_path,
   ndvi  <- (pir - rouge) / (pir + rouge)
   names(ndvi) <- "NDVI"
   ndvi_path <- file.path(output_dir, "ndvi.tif")
+  if (file.exists(ndvi_path)) file.remove(ndvi_path)
   writeRaster(ndvi, ndvi_path, overwrite = TRUE,
               gdal = c("COMPRESS=LZW"))
   message("NDVI:     ", ndvi_path)
@@ -935,12 +1117,14 @@ pipeline_aoi_to_chm <- function(aoi_path,
   par(mfrow = c(2, 2), mar = c(2, 2, 3, 4))
 
   # RVB
+  label_ortho <- if (is.null(ortho$millesime_ortho)) "plus récent" else ortho$millesime_ortho
+  label_irc   <- if (is.null(ortho$millesime_irc))   "plus récent" else ortho$millesime_irc
   plotRGB(ortho$rvb, r = 1, g = 2, b = 3, stretch = "lin",
-          main = "Ortho RVB IGN (0.20m)")
+          main = sprintf("Ortho RVB IGN 0.20m (millésime: %s)", label_ortho))
 
   # IRC fausses couleurs
   plotRGB(ortho$irc, r = 1, g = 2, b = 3, stretch = "lin",
-          main = "Ortho IRC fausses couleurs (0.20m)")
+          main = sprintf("Ortho IRC fausses couleurs 0.20m (millésime: %s)", label_irc))
 
   # NDVI
   col_ndvi <- colorRampPalette(
@@ -960,6 +1144,87 @@ pipeline_aoi_to_chm <- function(aoi_path,
   dev.off()
   message("PDF:      ", pdf_path)
 
+  # --- Visualisation interactive (RStudio) avec ggplot2 + patchwork ---
+  p_combined <- NULL
+  if (requireNamespace("ggplot2", quietly = TRUE) &&
+      requireNamespace("patchwork", quietly = TRUE) &&
+      requireNamespace("tidyterra", quietly = TRUE)) {
+
+    library(ggplot2)
+    library(patchwork)
+    library(tidyterra)
+
+    # Panel 1 : Ortho RVB
+    p_rvb <- ggplot() +
+      geom_spatraster_rgb(data = ortho$rvb, r = 1, g = 2, b = 3,
+                          max_col_value = 255) +
+      labs(title = sprintf("Ortho RVB 0.20m (%s)", label_ortho)) +
+      theme_minimal() +
+      theme(axis.text = element_blank(),
+            axis.title = element_blank(),
+            axis.ticks = element_blank(),
+            plot.title = element_text(size = 10, face = "bold"))
+
+    # Panel 2 : Ortho IRC fausses couleurs
+    p_irc <- ggplot() +
+      geom_spatraster_rgb(data = ortho$irc, r = 1, g = 2, b = 3,
+                          max_col_value = 255) +
+      labs(title = sprintf("Ortho IRC 0.20m (%s)", label_irc)) +
+      theme_minimal() +
+      theme(axis.text = element_blank(),
+            axis.title = element_blank(),
+            axis.ticks = element_blank(),
+            plot.title = element_text(size = 10, face = "bold"))
+
+    # Panel 3 : NDVI
+    p_ndvi <- ggplot() +
+      geom_spatraster(data = ndvi) +
+      scale_fill_gradientn(
+        colours = c("#d73027", "#fc8d59", "#fee08b", "#ffffbf",
+                    "#d9ef8b", "#91cf60", "#1a9850", "#006837"),
+        limits = c(-0.2, 1), na.value = "transparent",
+        name = "NDVI"
+      ) +
+      labs(title = "NDVI (depuis IRC)") +
+      theme_minimal() +
+      theme(axis.text = element_blank(),
+            axis.title = element_blank(),
+            axis.ticks = element_blank(),
+            plot.title = element_text(size = 10, face = "bold"))
+
+    # Panel 4 : CHM
+    p_chm <- ggplot() +
+      geom_spatraster(data = chm) +
+      scale_fill_gradientn(
+        colours = c("#f7fcb9", "#addd8e", "#41ab5d", "#006837", "#004529"),
+        na.value = "transparent",
+        name = "Hauteur (m)"
+      ) +
+      labs(title = paste("CHM", model_name)) +
+      theme_minimal() +
+      theme(axis.text = element_blank(),
+            axis.title = element_blank(),
+            axis.ticks = element_blank(),
+            plot.title = element_text(size = 10, face = "bold"))
+
+    p_combined <- (p_rvb | p_irc) / (p_ndvi | p_chm) +
+      plot_annotation(
+        title = "Pipeline Open-Canopy : ortho IGN \u2192 CHM",
+        subtitle = sprintf("AOI: %s | CHM: min=%.1fm, max=%.1fm, moy=%.1fm",
+                           basename(aoi_path),
+                           min(values(chm, na.rm = TRUE)),
+                           max(values(chm, na.rm = TRUE)),
+                           mean(values(chm, na.rm = TRUE))),
+        theme = theme(
+          plot.title = element_text(size = 14, face = "bold"),
+          plot.subtitle = element_text(size = 10, color = "grey40")
+        )
+      )
+
+    print(p_combined)
+    message("Plot patchwork affich\u00e9 dans RStudio")
+  }
+
   # --- Résumé ---
   dt <- round(difftime(Sys.time(), t0, units = "mins"), 1)
   chm_vals <- values(chm, na.rm = TRUE)
@@ -976,9 +1241,14 @@ pipeline_aoi_to_chm <- function(aoi_path,
     aoi       = aoi,
     ortho_rvb = ortho$rvb,
     ortho_irc = ortho$irc,
+    millesime_ortho = ortho$millesime_ortho,
+    millesime_irc   = ortho$millesime_irc,
+    layer_ortho     = ortho$layer_ortho,
+    layer_irc       = ortho$layer_irc,
     ndvi      = ndvi,
     chm_1_5m  = chm,
     chm_0_2m  = chm_hr,
+    plot      = p_combined,
     output_dir = output_dir
   ))
 }

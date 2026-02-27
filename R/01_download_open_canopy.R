@@ -45,7 +45,33 @@ IGN_WMTS_URL <- "https://data.geopf.fr/wmts"
 IGN_WMS_URL  <- "https://data.geopf.fr/wms-r"
 # Couches disponibles
 IGN_LAYER_ORTHO <- "ORTHOIMAGERY.ORTHOPHOTOS"
-IGN_LAYER_IRC   <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC-EXPRESS.2024"
+IGN_LAYER_IRC   <- "ORTHOIMAGERY.ORTHOPHOTOS.IRC"
+
+# --- Millésime (NULL = couche la plus récente disponible) ---
+# Exemples : "2024", "2023", "2021"...
+# Ortho RVB → couche ORTHOIMAGERY.ORTHOPHOTOS{année}
+# IRC       → couche ORTHOIMAGERY.ORTHOPHOTOS.IRC.{année}
+MILLESIME_ORTHO <- NULL
+MILLESIME_IRC   <- NULL
+
+#' Construire le nom de couche WMS en fonction du millésime
+#'
+#' @param type "ortho" ou "irc"
+#' @param millesime Année (chaîne ou numérique), NULL pour la couche courante
+#' @return Nom de couche WMS IGN
+ign_layer_name <- function(type = c("ortho", "irc"), millesime = NULL) {
+  type <- match.arg(type)
+  if (is.null(millesime)) {
+    if (type == "ortho") return(IGN_LAYER_ORTHO)
+    else                 return(IGN_LAYER_IRC)
+  }
+  millesime <- as.character(millesime)
+  if (type == "ortho") {
+    return(paste0("ORTHOIMAGERY.ORTHOPHOTOS", millesime))
+  } else {
+    return(paste0("ORTHOIMAGERY.ORTHOPHOTOS.IRC.", millesime))
+  }
+}
 
 # --- Répertoires ---
 DATA_DIR     <- file.path(getwd(), "data")
@@ -358,7 +384,7 @@ download_ign_wms <- function(bbox, layer = IGN_LAYER_ORTHO, res_m = RES_IGN,
     "SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap",
     "&LAYERS=", layer,
     "&CRS=EPSG:2154",
-    "&BBOX=", paste(ymin, xmin, ymax, xmax, sep = ","),
+    "&BBOX=", paste(xmin, ymin, xmax, ymax, sep = ","),
     "&WIDTH=", width,
     "&HEIGHT=", height,
     "&FORMAT=image/geotiff",
@@ -389,17 +415,52 @@ download_ign_wms <- function(bbox, layer = IGN_LAYER_ORTHO, res_m = RES_IGN,
 #'
 #' @param bbox Emprise c(xmin, ymin, xmax, ymax) en Lambert-93 (EPSG:2154)
 #' @param res_m Résolution en mètres
-#' @return Liste avec les chemins des fichiers RVB et IRC
-download_ign_ortho_pair <- function(bbox, res_m = RES_IGN) {
+#' @param millesime_ortho Millésime ortho RVB (NULL = plus récent)
+#' @param millesime_irc Millésime IRC (NULL = plus récent)
+#' @return Liste avec les chemins des fichiers RVB et IRC et millésimes
+download_ign_ortho_pair <- function(bbox, res_m = RES_IGN,
+                                     millesime_ortho = MILLESIME_ORTHO,
+                                     millesime_irc = MILLESIME_IRC) {
+  layer_ortho <- ign_layer_name("ortho", millesime_ortho)
+  layer_irc   <- ign_layer_name("irc",   millesime_irc)
+  label_ortho <- if (is.null(millesime_ortho)) "plus récent" else millesime_ortho
+  label_irc   <- if (is.null(millesime_irc))   "plus récent" else millesime_irc
+
   message("=== Téléchargement ortho IGN RVB + IRC ===")
   message(sprintf("Emprise: %.0f, %.0f, %.0f, %.0f (Lambert-93)",
                    bbox[1], bbox[2], bbox[3], bbox[4]))
   message(sprintf("Résolution: %.2f m", res_m))
+  message(sprintf("Millésime RVB: %s (couche: %s)", label_ortho, layer_ortho))
+  message(sprintf("Millésime IRC: %s (couche: %s)", label_irc, layer_irc))
 
-  rvb_path <- download_ign_wms(bbox, layer = IGN_LAYER_ORTHO, res_m = res_m)
-  irc_path <- download_ign_wms(bbox, layer = IGN_LAYER_IRC, res_m = res_m)
+  rvb_path <- tryCatch(
+    download_ign_wms(bbox, layer = layer_ortho, res_m = res_m),
+    error = function(e) {
+      if (!is.null(millesime_ortho)) {
+        message(sprintf("  Couche %s indisponible, fallback sur %s",
+                        layer_ortho, IGN_LAYER_ORTHO))
+        layer_ortho <<- IGN_LAYER_ORTHO
+        download_ign_wms(bbox, layer = IGN_LAYER_ORTHO, res_m = res_m)
+      } else stop(e)
+    }
+  )
+  irc_path <- tryCatch(
+    download_ign_wms(bbox, layer = layer_irc, res_m = res_m),
+    error = function(e) {
+      if (!is.null(millesime_irc)) {
+        message(sprintf("  Couche %s indisponible, fallback sur %s",
+                        layer_irc, IGN_LAYER_IRC))
+        layer_irc <<- IGN_LAYER_IRC
+        download_ign_wms(bbox, layer = IGN_LAYER_IRC, res_m = res_m)
+      } else stop(e)
+    }
+  )
 
-  return(list(rvb = rvb_path, irc = irc_path))
+  return(list(rvb = rvb_path, irc = irc_path,
+              millesime_ortho = millesime_ortho,
+              millesime_irc = millesime_irc,
+              layer_ortho = layer_ortho,
+              layer_irc = layer_irc))
 }
 
 # ==============================================================================
