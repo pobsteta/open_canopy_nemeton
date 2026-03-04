@@ -1242,8 +1242,9 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
         _decoder_stride = 2
     else:
         _decoder_stride = None  # sera = downsample_factor (1 seule couche)
+    _ds_label = _decoder_stride if _decoder_stride else "auto(=downsample_factor)"
     print(f"  Seg head checkpoint: {len(_seg_ckpt_keys)} cles, "
-          f"nested={_has_nested}, decoder_stride={_decoder_stride or 'auto(=downsample_factor)'}")
+          f"nested={_has_nested}, decoder_stride={_ds_label}")
 
     # PVTv2 reduit par facteur 32 : img_size doit etre multiple de 32
     _pad_multiple = 32
