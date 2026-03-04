@@ -70,8 +70,8 @@ RES_SPOT <- 1.5   # Modèles Open-Canopy (SPOT 6-7)
 HF_REPO_ID <- "AI4Forest/Open-Canopy"
 CONDA_ENV  <- "open_canopy"
 N_INPUT_CHANNELS <- 4  # R, G, B, NIR (ordre SPOT 6-7)
-# Chemin vers le code source Open-Canopy (nécessaire pour PVTv2)
-OPEN_CANOPY_SRC <- NULL  # Sera détecté automatiquement ou passé en paramètre
+# Chemin vers le code source Open-Canopy (optionnel pour PVTv2)
+OPEN_CANOPY_SRC <- NULL  # Auto-détecté, téléchargé, ou module embarqué
 
 # --- Limites WMS ---
 WMS_MAX_PX <- 4096  # Taille max par requête WMS
@@ -596,6 +596,106 @@ download_model <- function(model_name = "pvtv2") {
     message('     result <- pipeline_aoi_to_chm("data/aoi.gpkg",')
     message('       model_path = "chemin/vers/checkpoint.ckpt")')
     stop("Échec du téléchargement du modèle.", call. = FALSE)
+  })
+}
+
+#' Télécharger le code source Open-Canopy
+#'
+#' Clone le dépôt GitHub Open-Canopy dans un dossier cache local.
+#' Réutilise le clone existant si déjà présent.
+#'
+#' @param dest Dossier de destination (NULL = cache utilisateur)
+#' @param force Forcer le re-téléchargement même si déjà présent
+#' @return Chemin vers le dossier Open-Canopy cloné, ou NULL en cas d'échec
+#' @export
+download_open_canopy_src <- function(dest = NULL, force = FALSE) {
+  repo_url <- "https://github.com/fajwel/Open-Canopy.git"
+
+  # Dossier cache par défaut
+  if (is.null(dest)) {
+    cache_dir <- tools::R_user_dir("opencanopy", "cache")
+    dest <- file.path(cache_dir, "Open-Canopy")
+  }
+
+  # Vérifier si déjà présent
+  if (dir.exists(file.path(dest, "src", "models")) && !force) {
+    message("Open-Canopy source déjà en cache: ", dest)
+    return(dest)
+  }
+
+  # Vérifier que git est disponible
+  git_ok <- tryCatch({
+    res <- system2("git", "--version", stdout = TRUE, stderr = TRUE)
+    length(res) > 0
+  }, error = function(e) FALSE)
+
+  if (!git_ok) {
+    message("git n'est pas disponible, téléchargement par archive ZIP")
+    return(.download_open_canopy_zip(dest))
+  }
+
+  # Clone superficiel (seulement le dernier commit)
+  message("Clonage d'Open-Canopy (shallow clone)...")
+  dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+
+  # Supprimer le dossier incomplet si force
+  if (force && dir.exists(dest)) {
+    unlink(dest, recursive = TRUE)
+  }
+
+  res <- tryCatch({
+    system2("git", c("clone", "--depth", "1", repo_url, dest),
+            stdout = TRUE, stderr = TRUE)
+  }, error = function(e) {
+    message("Erreur git clone: ", e$message)
+    return(NULL)
+  })
+
+  if (dir.exists(file.path(dest, "src", "models"))) {
+    message("Open-Canopy source téléchargé: ", dest)
+    return(dest)
+  }
+
+  message("Le clone git a échoué, tentative par archive ZIP...")
+  .download_open_canopy_zip(dest)
+}
+
+#' Télécharger Open-Canopy par archive ZIP (fallback sans git)
+#' @param dest Dossier de destination
+#' @return Chemin vers le dossier Open-Canopy, ou NULL en cas d'échec
+#' @keywords internal
+.download_open_canopy_zip <- function(dest) {
+  zip_url <- "https://github.com/fajwel/Open-Canopy/archive/refs/heads/main.zip"
+  tmp_zip <- tempfile(fileext = ".zip")
+
+  tryCatch({
+    dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+    message("Téléchargement de l'archive Open-Canopy...")
+    download.file(zip_url, tmp_zip, mode = "wb", quiet = TRUE)
+
+    # Extraire dans un dossier temporaire
+    tmp_dir <- tempfile("oc_extract_")
+    utils::unzip(tmp_zip, exdir = tmp_dir)
+    unlink(tmp_zip)
+
+    # GitHub nomme le dossier "Open-Canopy-main"
+    extracted <- list.dirs(tmp_dir, recursive = FALSE, full.names = TRUE)
+    if (length(extracted) == 1) {
+      if (dir.exists(dest)) unlink(dest, recursive = TRUE)
+      file.rename(extracted[1], dest)
+      unlink(tmp_dir, recursive = TRUE)
+    }
+
+    if (dir.exists(file.path(dest, "src", "models"))) {
+      message("Open-Canopy source téléchargé (ZIP): ", dest)
+      return(dest)
+    }
+
+    message("Extraction réussie mais structure inattendue dans: ", dest)
+    return(NULL)
+  }, error = function(e) {
+    message("Échec du téléchargement ZIP: ", e$message)
+    return(NULL)
   })
 }
 
@@ -1151,14 +1251,15 @@ pipeline_aoi_to_chm <- function(aoi_path,
   # --- Étape 4 : Inférence ---
   message("\n>>> ÉTAPE 4/5 : Inférence du modèle ", model_name)
 
-  # Auto-détecter le code source Open-Canopy (optionnel pour PVTv2,
-  # le module embarqué timmnet_standalone.py suffit normalement)
+  # Auto-détecter ou télécharger le code source Open-Canopy (pour PVTv2)
   if (is.null(open_canopy_src) && model_name == "pvtv2") {
+    # 1. Chercher dans les emplacements courants
     candidates <- c(
       file.path(getwd(), "Open-Canopy"),
       file.path(dirname(getwd()), "Open-Canopy"),
       file.path(Sys.getenv("USERPROFILE"), "dev", "Open-Canopy"),
-      file.path(Sys.getenv("HOME"), "dev", "Open-Canopy")
+      file.path(Sys.getenv("HOME"), "dev", "Open-Canopy"),
+      file.path(tools::R_user_dir("opencanopy", "cache"), "Open-Canopy")
     )
     for (cand in candidates) {
       if (dir.exists(file.path(cand, "src", "models"))) {
@@ -1167,9 +1268,10 @@ pipeline_aoi_to_chm <- function(aoi_path,
         break
       }
     }
-    # Plus de stop() ici : le module embarqué prend le relais
+    # 2. Sinon, télécharger automatiquement
     if (is.null(open_canopy_src)) {
-      message("Note: Open-Canopy source non trouvé, utilisation du module embarqué")
+      message("Open-Canopy source non trouvé localement, téléchargement...")
+      open_canopy_src <- download_open_canopy_src()
     }
   }
 

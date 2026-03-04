@@ -47,6 +47,7 @@ export(download_ortho_for_aoi)
 export(setup_python)
 export(find_checkpoint_name)
 export(download_model)
+export(download_open_canopy_src)
 export(pipeline_aoi_to_chm)
 
 import(terra)
