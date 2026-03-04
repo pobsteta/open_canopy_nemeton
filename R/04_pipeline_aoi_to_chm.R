@@ -1034,33 +1034,41 @@ def smart_load_state_dict(model, ckpt_state_dict, prefixes_to_strip):
     model_keys = set(model.state_dict().keys())
     ckpt_keys = set(best_dict.keys())
 
-    if len(best_missing) > len(model_keys) * 0.5:
-        # Trop de cles manquantes - tenter la conversion dot/underscore
-        # timm features_only peut transformer stages.0 en stages_0
+    if len(best_missing) > len(model_keys) * 0.1:
         print(f"  Mapping automatique ({len(best_missing)} cles manquantes sur {len(model_keys)})")
 
-        # Strategie : pour chaque cle du modele, chercher la cle checkpoint correspondante
-        # en normalisant dots et underscores dans les numeros
         def normalize_key(k):
             """stages_0.blocks_1 -> stages.0.blocks.1"""
             return re.sub(r"_(\\d+)", r".\\1", k)
 
-        model_norm = {normalize_key(k): k for k in model_keys}
+        # Construire un index inverse : cle normalisee -> cle checkpoint
         ckpt_norm = {normalize_key(k): k for k in ckpt_keys}
 
-        remapped = {}
-        matched = 0
-        for norm_k, model_k in model_norm.items():
-            if norm_k in ckpt_norm:
-                ckpt_k = ckpt_norm[norm_k]
-                remapped[model_k] = best_dict[ckpt_k]
-                matched += 1
+        # Combiner matches directs ET normalises
+        combined = {}
+        matched_direct = 0
+        matched_norm = 0
 
-        if matched > len(best_missing) * 0.5:
-            print(f"  {matched}/{len(model_keys)} cles remappees")
-            missing, unexpected = model.load_state_dict(remapped, strict=False)
-            print(f"  Apres remapping: {len(missing)} manquantes, {len(unexpected)} inattendues")
-            if len(missing) < 5:
+        for model_k in model_keys:
+            # 1. Match direct : la cle existe telle quelle dans best_dict
+            if model_k in best_dict:
+                combined[model_k] = best_dict[model_k]
+                matched_direct += 1
+            else:
+                # 2. Match normalise : stages_0 -> stages.0
+                norm_k = normalize_key(model_k)
+                if norm_k in ckpt_norm:
+                    ckpt_k = ckpt_norm[norm_k]
+                    combined[model_k] = best_dict[ckpt_k]
+                    matched_norm += 1
+
+        total = matched_direct + matched_norm
+        print(f"  {total}/{len(model_keys)} cles trouvees ({matched_direct} directes, {matched_norm} normalisees)")
+
+        if total > len(best_missing) * 0.5:
+            missing, unexpected = model.load_state_dict(combined, strict=False)
+            print(f"  Apres chargement: {len(missing)} manquantes, {len(unexpected)} inattendues")
+            if 0 < len(missing) <= 10:
                 for m in missing:
                     print(f"    - {m}")
             return missing, unexpected
