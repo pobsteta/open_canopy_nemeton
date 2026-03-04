@@ -405,6 +405,36 @@ resample_to_spot <- function(ign_raster) {
 setup_python <- function() {
   library(reticulate)
 
+  # Vérifier si Python est déjà configuré (ex: lancé depuis conda activate)
+  py_ok <- tryCatch(nzchar(py_config()$python), error = function(e) FALSE)
+
+  if (!py_ok) {
+    # Chercher l'env conda par nom (Miniforge, Miniconda, Anaconda)
+    conda_envs <- tryCatch(conda_list(), error = function(e) data.frame())
+    if (nrow(conda_envs) > 0) {
+      match_idx <- grep(CONDA_ENV, conda_envs$name, ignore.case = TRUE)
+      if (length(match_idx) > 0) {
+        use_python(conda_envs$python[match_idx[1]], required = TRUE)
+        message("  Env conda détecté: ", conda_envs$name[match_idx[1]])
+      }
+    }
+    # Fallback : CONDA_PREFIX
+    if (!tryCatch(nzchar(py_config()$python), error = function(e) FALSE)) {
+      conda_prefix <- Sys.getenv("CONDA_PREFIX", "")
+      if (nzchar(conda_prefix)) {
+        py_path <- if (.Platform$OS.type == "windows") {
+          file.path(conda_prefix, "python.exe")
+        } else {
+          file.path(conda_prefix, "bin", "python")
+        }
+        if (file.exists(py_path)) {
+          use_python(py_path, required = TRUE)
+          message("  Python (CONDA_PREFIX): ", conda_prefix)
+        }
+      }
+    }
+  }
+
   # Modules Python essentiels (inférence)
   modules_core <- c("torch", "numpy", "rasterio",
                      "segmentation_models_pytorch", "timm")

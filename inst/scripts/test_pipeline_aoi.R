@@ -85,18 +85,57 @@ if (area_km2 > 25) {
 cat("\n>>> Étape 3 : Vérification de l'environnement Python\n")
 
 library(reticulate)
-tryCatch({
-  use_condaenv("open_canopy", required = TRUE)
-  cat(sprintf("  Conda env : open_canopy\n"))
-  cat(sprintf("  Python    : %s\n", py_config()$python))
-}, error = function(e) {
-  cat("  ATTENTION : env conda 'open_canopy' non trouvé.\n")
-  cat("  Le pipeline nécessite Python avec PyTorch pour l'inférence.\n")
+
+# Détecter l'environnement conda (Miniforge, Miniconda, Anaconda)
+conda_found <- FALSE
+
+# 1. Si Python est déjà dans le PATH (ex: RStudio lancé depuis conda activate)
+python_in_path <- tryCatch({
+  cfg <- py_config()
+  nzchar(cfg$python)
+}, error = function(e) FALSE)
+
+if (!python_in_path) {
+  # 2. Chercher l'env conda par nom (fonctionne avec Miniforge/Miniconda/Anaconda)
+  conda_envs <- tryCatch(conda_list(), error = function(e) data.frame())
+  if (nrow(conda_envs) > 0) {
+    match_idx <- grep("open_canopy", conda_envs$name, ignore.case = TRUE)
+    if (length(match_idx) > 0) {
+      use_python(conda_envs$python[match_idx[1]], required = TRUE)
+      conda_found <- TRUE
+      cat(sprintf("  Conda env : %s\n", conda_envs$name[match_idx[1]]))
+    }
+  }
+
+  if (!conda_found) {
+    # 3. Chercher via CONDA_PREFIX (variable définie quand un env est activé)
+    conda_prefix <- Sys.getenv("CONDA_PREFIX", "")
+    if (nzchar(conda_prefix)) {
+      py_path <- if (.Platform$OS.type == "windows") {
+        file.path(conda_prefix, "python.exe")
+      } else {
+        file.path(conda_prefix, "bin", "python")
+      }
+      if (file.exists(py_path)) {
+        use_python(py_path, required = TRUE)
+        conda_found <- TRUE
+        cat(sprintf("  Conda env (CONDA_PREFIX) : %s\n", conda_prefix))
+      }
+    }
+  }
+}
+
+if (python_in_path || conda_found) {
+  cat(sprintf("  Python : %s\n", py_config()$python))
+} else {
+  cat("  ATTENTION : aucun environnement Python detecte.\n")
+  cat("  Le pipeline necessite Python avec PyTorch pour l'inference.\n")
   cat("  Installation :\n")
   cat("    conda create -n open_canopy python=3.10\n")
   cat("    conda activate open_canopy\n")
   cat("    pip install torch torchvision numpy rasterio segmentation-models-pytorch timm\n")
-})
+  cat("  Puis lancez RStudio depuis cet environnement.\n")
+}
 
 modules_core <- c("torch", "numpy", "rasterio",
                    "segmentation_models_pytorch", "timm")
