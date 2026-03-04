@@ -17,7 +17,7 @@
 # Architecture Open-Canopy :
 #   - Modèle UNet (smp) avec encodeur ResNet34, 4 canaux → 1 sortie
 #   - Modèle PVTv2 (timm) avec pvt_v2_b3, 4 canaux → 1 sortie
-#   - Entrée : 4 bandes (R, G, B, NIR) avec normalisation extraite du checkpoint
+#   - Entrée : 4 bandes (R, G, B, NIR), valeurs brutes (PAS de normalisation)
 #   - Sortie : hauteur de canopée en mètres (targets stockés en dm / 10)
 #   - Checkpoint : PyTorch Lightning, clés préfixées "net.seg_model."
 # ==============================================================================
@@ -873,7 +873,7 @@ with rasterio.open("__INPUT_PATH__") as src:
 num_bands, H, W = image.shape
 print(f"Image chargee: {num_bands} bandes, {H}x{W} px")
 
-# Tensor brut - normalisation appliquee apres lecture du checkpoint
+# Tensor brut - le modele Open-Canopy attend les valeurs brutes (pas de normalisation)
 tensor = torch.from_numpy(image).unsqueeze(0)  # (1, C, H, W)
 print(f"Tensor: shape={tuple(tensor.shape)}, "
       f"min={tensor.min():.1f}, max={tensor.max():.1f}")
@@ -947,67 +947,25 @@ except (ModuleNotFoundError, ImportError) as e:
 print(f"Checkpoint cles: {list(checkpoint.keys())}")
 
 # ======================================================================
-# Extraire mean/std du checkpoint pour normaliser l entree
+# Extraire mean/std du checkpoint (informatif uniquement)
+# ======================================================================
+# IMPORTANT: Le code source Open-Canopy (canopy_datamodule.py) cree les
+# datasets avec mean=0, std=1 (aucune normalisation). Les mean/std stockes
+# dans datamodule_hyper_parameters sont des parametres du constructeur
+# sauvegardes par save_hyperparameters() mais JAMAIS utilises dans le
+# pipeline de donnees. Le modele a ete entraine sur les valeurs brutes
+# des pixels. Ne PAS appliquer de normalisation !
 # ======================================================================
 dm_hparams = checkpoint.get("datamodule_hyper_parameters", {})
 model_hparams = checkpoint.get("hyper_parameters", {})
 
-print(f"Datamodule hparams: {dm_hparams}")
 _nc = model_hparams.get("num_channels", "?")
 _mn = dm_hparams.get("mean", "?")
 _sd = dm_hparams.get("std", "?")
-print(f"Model hparams: num_channels={_nc}, mean={_mn}, std={_sd}")
-
-# Recuperer mean/std pour la normalisation
-_ckpt_mean = dm_hparams.get("mean", None)
-_ckpt_std = dm_hparams.get("std", None)
-
-# Appliquer la normalisation sur le tensor d entree
-if _ckpt_mean is not None and _ckpt_std is not None:
-    import ast
-    # mean/std peuvent etre des listes (par bande) ou des scalaires
-    if isinstance(_ckpt_mean, str):
-        try:
-            _ckpt_mean = ast.literal_eval(_ckpt_mean)
-        except Exception:
-            pass
-    if isinstance(_ckpt_std, str):
-        try:
-            _ckpt_std = ast.literal_eval(_ckpt_std)
-        except Exception:
-            pass
-
-    _mean_t = torch.tensor(_ckpt_mean, dtype=torch.float32)
-    _std_t = torch.tensor(_ckpt_std, dtype=torch.float32)
-
-    # Reshape pour broadcasting (1, C, 1, 1)
-    if _mean_t.dim() == 1:
-        _mean_t = _mean_t.reshape(1, -1, 1, 1)
-        _std_t = _std_t.reshape(1, -1, 1, 1)
-
-    # Si les valeurs sont non-triviales (pas 0/1), appliquer la normalisation
-    if not (torch.all(_mean_t == 0) and torch.all(_std_t == 1)):
-        tensor = (tensor - _mean_t) / _std_t
-        print(f"  Normalisation appliquee: mean={_ckpt_mean}, std={_ckpt_std}")
-        print(f"  Tensor normalise: min={tensor.min():.3f}, max={tensor.max():.3f}")
-    else:
-        print("  mean=0, std=1 : pas de normalisation specifique")
-        # Verifier si les valeurs sont en 8-bit -> convertir en reflectance
-        if tensor.max() > 255:
-            tensor = tensor / 10000.0
-            print(f"  Conversion reflectance /10000: min={tensor.min():.4f}, max={tensor.max():.4f}")
-        elif tensor.max() > 1:
-            tensor = tensor / 255.0
-            print(f"  Conversion 8-bit /255: min={tensor.min():.4f}, max={tensor.max():.4f}")
-else:
-    # Pas de mean/std dans le checkpoint : normaliser heuristiquement
-    print("  Pas de mean/std dans le checkpoint")
-    if tensor.max() > 255:
-        tensor = tensor / 10000.0
-        print(f"  Conversion reflectance /10000: min={tensor.min():.4f}, max={tensor.max():.4f}")
-    elif tensor.max() > 1:
-        tensor = tensor / 255.0
-        print(f"  Conversion 8-bit /255: min={tensor.min():.4f}, max={tensor.max():.4f}")
+print(f"Model hparams: num_channels={_nc}")
+print(f"Datamodule hparams mean={_mn}, std={_sd} (NON utilises a l entrainement)")
+print(f"  -> Pas de normalisation (le modele attend les valeurs brutes des pixels)")
+print(f"  Tensor brut: min={tensor.min():.3f}, max={tensor.max():.3f}")
 
 state_dict = checkpoint.get("state_dict", checkpoint)
 keys = list(state_dict.keys())
@@ -1368,8 +1326,8 @@ with torch.no_grad():
     elif pred.ndim == 3:
         pred = pred[:, :_orig_H, :_orig_W]
 
-    # Le modele predit en metres (valeurs brutes)
-    pred = np.clip(pred, 0, 50)
+    # Le modele predit en metres (conforme a regression_module.py)
+    pred = np.clip(pred, 0, 500)
     pred = np.round(pred, 1)
 
     print(f"CHM predit: min={pred.min():.1f}m, max={pred.max():.1f}m, "
