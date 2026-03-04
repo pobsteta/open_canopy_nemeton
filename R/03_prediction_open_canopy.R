@@ -55,16 +55,50 @@ setup_conda_env <- function(envname = CONDA_ENV) {
   }
 }
 
+#' Trouver le nom du fichier checkpoint dans un dépôt HF via l'API
+#'
+#' Interroge l'API Hugging Face pour découvrir les fichiers checkpoint
+#' disponibles dans le répertoire pretrained_models/ du dataset.
+#'
+#' @param repo_id Identifiant du dépôt HF (ex: "AI4Forest/Open-Canopy")
+#' @param model_name "unet" ou "pvtv2" pour filtrer
+#' @return Chemin du fichier checkpoint dans le dépôt, ou NULL
+find_checkpoint_name <- function(repo_id = "AI4Forest/Open-Canopy",
+                                  model_name = "unet") {
+  url <- paste0("https://huggingface.co/api/datasets/", repo_id)
+  resp <- tryCatch(
+    httr2::request(url) |> httr2::req_perform(),
+    error = function(e) NULL
+  )
+  if (is.null(resp)) return(NULL)
+
+  info <- jsonlite::fromJSON(httr2::resp_body_string(resp))
+  files <- info$siblings$rfilename
+  ckpt_files <- files[grepl("^pretrained_models/.*\\.ckpt$", files)]
+  if (length(ckpt_files) == 0) return(NULL)
+
+  # Filtrer par nom de modèle
+  pattern <- switch(model_name,
+    unet  = "unet|smp",
+    pvtv2 = "pvt|pvtv2",
+    model_name
+  )
+  matches <- ckpt_files[grep(pattern, ckpt_files, ignore.case = TRUE)]
+  if (length(matches) > 0) return(matches[1])
+  return(ckpt_files[1])
+}
+
 #' Télécharger les modèles pré-entraînés depuis Hugging Face
+#'
+#' Utilise le package R hfhub (natif, sans Python) pour télécharger
+#' le fichier checkpoint. Fallback sur Python huggingface_hub si hfhub
+#' n'est pas installé.
 #'
 #' @param model_name "unet" ou "pvtv2"
 #' @return Chemin local du modèle
 download_pretrained_model <- function(model_name = "unet") {
-  library(reticulate)
-
-  hf_hub <- import("huggingface_hub")
-
   repo_id <- "AI4Forest/Open-Canopy"
+
   model_files <- list(
     unet = "pretrained_models/unet_best.ckpt",
     pvtv2 = "pretrained_models/pvtv2_best.ckpt"
@@ -75,17 +109,42 @@ download_pretrained_model <- function(model_name = "unet") {
          ". Choisir parmi: ", paste(names(model_files), collapse = ", "))
   }
 
-  filename <- model_files[[model_name]]
   message("Téléchargement du modèle ", model_name, "...")
+  message("Depuis: ", repo_id)
 
-  local_path <- hf_hub$hf_hub_download(
-    repo_id = repo_id,
-    filename = filename,
-    repo_type = "dataset"
-  )
+  # --- Méthode 1 : hfhub R natif (préféré) ---
+  if (requireNamespace("hfhub", quietly = TRUE)) {
+    ckpt_name <- find_checkpoint_name(repo_id, model_name)
+    if (is.null(ckpt_name)) {
+      ckpt_name <- model_files[[model_name]]
+    }
+    message("  Téléchargement via hfhub (R natif): ", ckpt_name)
+    tryCatch({
+      local_path <- hfhub::hub_download(repo_id, ckpt_name,
+                                          repo_type = "dataset")
+      message("  Modèle téléchargé: ", local_path)
+      return(local_path)
+    }, error = function(e) {
+      message("  hfhub échoué: ", e$message, " \u2192 fallback Python")
+    })
+  }
 
-  message("Modèle téléchargé: ", local_path)
-  return(local_path)
+  # --- Méthode 2 : Python huggingface_hub (fallback) ---
+  library(reticulate)
+  hf_hub <- import("huggingface_hub")
+
+  filename <- model_files[[model_name]]
+  tryCatch({
+    local_path <- hf_hub$hf_hub_download(
+      repo_id = repo_id,
+      filename = filename,
+      repo_type = "dataset"
+    )
+    message("  Modèle téléchargé: ", local_path)
+    return(local_path)
+  }, error = function(e) {
+    stop("Échec du téléchargement: ", e$message, call. = FALSE)
+  })
 }
 
 # ==============================================================================

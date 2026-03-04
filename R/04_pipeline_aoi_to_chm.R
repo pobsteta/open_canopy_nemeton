@@ -398,43 +398,116 @@ resample_to_spot <- function(ign_raster) {
 # ==============================================================================
 
 #' Configurer l'environnement Python
+#'
+#' Vérifie que les modules Python nécessaires sont disponibles.
+#' Note : huggingface_hub Python n'est plus requis si le package R hfhub
+#' est installé (méthode préférée pour le téléchargement des modèles).
 setup_python <- function() {
   library(reticulate)
 
-  # Vérifier les modules nécessaires
-  modules <- c("torch", "numpy", "rasterio", "huggingface_hub",
-               "segmentation_models_pytorch", "timm")
+  # Modules Python essentiels (inférence)
+  modules_core <- c("torch", "numpy", "rasterio",
+                     "segmentation_models_pytorch", "timm")
+  # huggingface_hub Python est optionnel si hfhub R est disponible
+  has_hfhub_r <- requireNamespace("hfhub", quietly = TRUE)
+
   ok <- TRUE
-  for (mod in modules) {
+  for (mod in modules_core) {
     avail <- py_module_available(mod)
     message(sprintf("  Python %s: %s", mod, ifelse(avail, "OK", "MANQUANT")))
     if (!avail) ok <- FALSE
   }
 
-  if (!ok) {
-    stop("Modules Python manquants. Installez-les dans l'env '", CONDA_ENV, "':\n",
-         "  conda activate ", CONDA_ENV, "\n",
-         "  pip install torch torchvision numpy rasterio huggingface_hub ",
-         "segmentation-models-pytorch timm")
+  # Vérifier huggingface_hub Python seulement si hfhub R n'est pas dispo
+  if (has_hfhub_r) {
+    message("  hfhub (R natif): OK (téléchargement HF sans Python)")
+  } else {
+    hf_avail <- py_module_available("huggingface_hub")
+    message(sprintf("  Python huggingface_hub: %s",
+                     ifelse(hf_avail, "OK", "MANQUANT")))
+    if (!hf_avail) ok <- FALSE
   }
+
+  if (!ok) {
+    pip_cmd <- "  pip install torch torchvision numpy rasterio segmentation-models-pytorch timm"
+    if (!has_hfhub_r) {
+      pip_cmd <- paste0(pip_cmd, " huggingface_hub")
+    }
+    stop("Modules Python manquants. Installez-les dans l'env '", CONDA_ENV, "':\n",
+         "  conda activate ", CONDA_ENV, "\n", pip_cmd,
+         "\n\nOu installez le package R hfhub pour éviter la dépendance Python huggingface_hub :\n",
+         "  install.packages('hfhub')")
+  }
+}
+
+#' Trouver le nom du fichier checkpoint dans le dataset HF via l'API
+#'
+#' Interroge l'API Hugging Face pour découvrir les fichiers checkpoint
+#' disponibles dans le répertoire pretrained_models/ du dataset.
+#'
+#' @param repo_id Identifiant du dépôt HF (ex: "AI4Forest/Open-Canopy")
+#' @param model_name "unet" ou "pvtv2" pour filtrer
+#' @return Chemin du fichier checkpoint dans le dépôt, ou NULL
+find_checkpoint_name <- function(repo_id = HF_REPO_ID,
+                                  model_name = "unet") {
+  url <- paste0("https://huggingface.co/api/datasets/", repo_id)
+  resp <- tryCatch(
+    httr2::request(url) |> httr2::req_perform(),
+    error = function(e) NULL
+  )
+  if (is.null(resp)) return(NULL)
+
+  info <- jsonlite::fromJSON(httr2::resp_body_string(resp))
+  files <- info$siblings$rfilename
+  ckpt_files <- files[grepl("^pretrained_models/.*\\.ckpt$", files)]
+  if (length(ckpt_files) == 0) return(NULL)
+
+  # Filtrer par nom de modèle
+  pattern <- switch(model_name,
+    unet  = "unet|smp",
+    pvtv2 = "pvt|pvtv2",
+    model_name
+  )
+  matches <- ckpt_files[grep(pattern, ckpt_files, ignore.case = TRUE)]
+  if (length(matches) > 0) return(matches[1])
+  return(ckpt_files[1])
 }
 
 #' Télécharger le modèle pré-entraîné depuis Hugging Face
 #'
-#' Découvre dynamiquement les fichiers .ckpt dans pretrained_models/
-#' du dataset AI4Forest/Open-Canopy et télécharge celui correspondant
-#' au modèle demandé.
+#' Utilise le package R hfhub (natif, sans Python) pour télécharger
+#' le fichier checkpoint. Fallback sur Python huggingface_hub si hfhub
+#' n'est pas installé.
 #'
 #' @param model_name "unet" ou "pvtv2"
 #' @return Chemin local du modèle
 download_model <- function(model_name = "unet") {
+  message("Téléchargement du modèle: ", model_name)
+  message("Depuis: ", HF_REPO_ID)
+
+  # --- Méthode 1 : hfhub R natif (préféré) ---
+  if (requireNamespace("hfhub", quietly = TRUE)) {
+    ckpt_name <- find_checkpoint_name(HF_REPO_ID, model_name)
+    if (!is.null(ckpt_name)) {
+      message("  Téléchargement via hfhub (R natif): ", ckpt_name)
+      tryCatch({
+        local_path <- hfhub::hub_download(HF_REPO_ID, ckpt_name,
+                                            repo_type = "dataset")
+        message("  Modèle téléchargé: ", local_path)
+        return(local_path)
+      }, error = function(e) {
+        message("  hfhub échoué: ", e$message, " \u2192 fallback Python")
+      })
+    }
+  }
+
+  # --- Méthode 2 : Python huggingface_hub (fallback) ---
   library(reticulate)
   hf_hub <- import("huggingface_hub")
 
   # Vérifier que le token HuggingFace est configuré (dataset gated)
   token <- Sys.getenv("HF_TOKEN", unset = "")
   if (token == "") {
-    # Vérifier si huggingface-cli login a été fait
     tryCatch({
       stored <- hf_hub$HfFolder$get_token()
       if (is.null(stored) || stored == "") stop("no token")
@@ -448,21 +521,15 @@ download_model <- function(model_name = "unet") {
     })
   }
 
-  message("Recherche des checkpoints dans le dataset HuggingFace...")
+  message("Recherche des checkpoints via Python huggingface_hub...")
 
-  # Lister dynamiquement les fichiers .ckpt dans pretrained_models/
   tryCatch({
     api <- hf_hub$HfApi()
 
-    # Utiliser list_repo_files (retourne des chaînes) — plus robuste que list_repo_tree
     all_files <- tryCatch({
-      files <- api$list_repo_files(
-        HF_REPO_ID,
-        repo_type = "dataset"
-      )
+      files <- api$list_repo_files(HF_REPO_ID, repo_type = "dataset")
       reticulate::iterate(files)
     }, error = function(e) {
-      # Fallback : list_repo_tree avec gestion des attributs
       tree <- api$list_repo_tree(
         HF_REPO_ID,
         path_in_repo = "pretrained_models",
@@ -479,7 +546,6 @@ download_model <- function(model_name = "unet") {
       paths
     })
 
-    # Filtrer les .ckpt dans pretrained_models/
     ckpt_files <- character(0)
     for (f in all_files) {
       fname <- as.character(f)
@@ -495,7 +561,6 @@ download_model <- function(model_name = "unet") {
     message("Checkpoints disponibles:")
     for (f in ckpt_files) message("  - ", f)
 
-    # Trouver le checkpoint correspondant au modèle demandé
     pattern <- switch(model_name,
       unet  = "unet|smp",
       pvtv2 = "pvt|pvtv2",
@@ -526,7 +591,8 @@ download_model <- function(model_name = "unet") {
     message("Alternatives :")
     message("  1. Définir votre token : Sys.setenv(HF_TOKEN = 'hf_...')")
     message("  2. Se connecter via CLI : huggingface-cli login")
-    message("  3. Fournir le chemin manuellement :")
+    message("  3. Installer hfhub R : install.packages('hfhub')")
+    message("  4. Fournir le chemin manuellement :")
     message('     result <- pipeline_aoi_to_chm("data/aoi.gpkg",')
     message('       model_path = "chemin/vers/checkpoint.ckpt")')
     stop("Échec du téléchargement du modèle.", call. = FALSE)

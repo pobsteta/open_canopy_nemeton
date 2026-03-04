@@ -43,6 +43,10 @@ Le projet **Open-Canopy** fournit des modèles (UNet, PVTv2) entraînés sur ima
 ```r
 install.packages(c("terra", "sf", "httr2", "jsonlite", "curl", "fs"))
 install.packages("reticulate")  # Interface Python
+
+# Recommandé : hfhub pour télécharger les modèles depuis Hugging Face
+# sans dépendance Python (R natif)
+install.packages("hfhub")
 ```
 
 ### Environnement Python (miniforge + conda)
@@ -55,8 +59,20 @@ L'environnement conda `open_canopy` doit être installé avec PyTorch :
 
 conda create -n open_canopy python=3.10
 conda activate open_canopy
-pip install torch torchvision numpy rasterio huggingface_hub
+pip install torch torchvision numpy rasterio segmentation-models-pytorch timm
+
+# huggingface_hub Python est optionnel si le package R hfhub est installé
+# pip install huggingface_hub
 ```
+
+### Téléchargement des modèles depuis Hugging Face
+
+Deux méthodes sont supportées (la première est préférée) :
+
+1. **hfhub R natif** (recommandé) : `install.packages("hfhub")` — aucune dépendance Python pour le téléchargement
+2. **Python huggingface_hub** (fallback) : `pip install huggingface_hub` — utilisé si hfhub n'est pas installé
+
+Le téléchargement utilise automatiquement la meilleure méthode disponible.
 
 ### Connexion R → Python
 
