@@ -1079,7 +1079,7 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
 # Inference
 # ======================================================================
 if model is None:
-    raise RuntimeError("Le modele n'a pas pu etre charge. Verifiez les logs ci-dessus.")
+    raise RuntimeError("Le modele na pas pu etre charge. Verifiez les logs ci-dessus.")
 
 with torch.no_grad():
     output = model(tensor)
