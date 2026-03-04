@@ -1233,6 +1233,18 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
         msg += "  Verifiez que timm est installe: pip install timm"
         raise RuntimeError(msg)
 
+    # Detecter decoder_stride depuis les cles seg_head du checkpoint
+    # 2 cles (layers.0.weight/bias) = stride unique = downsample_factor
+    # 50+ cles (layers.0.0.weight...) = stride=2 avec couches intermediaires
+    _seg_ckpt_keys = [k for k in keys if "seg_head" in k]
+    _has_nested = any(".layers.0.0." in k for k in _seg_ckpt_keys)
+    if _has_nested:
+        _decoder_stride = 2
+    else:
+        _decoder_stride = None  # sera = downsample_factor (1 seule couche)
+    print(f"  Seg head checkpoint: {len(_seg_ckpt_keys)} cles, "
+          f"nested={_has_nested}, decoder_stride={_decoder_stride or 'auto(=downsample_factor)'}")
+
     # PVTv2 reduit par facteur 32 : img_size doit etre multiple de 32
     _pad_multiple = 32
     _img_size = ((max(H, W) + _pad_multiple - 1) // _pad_multiple) * _pad_multiple
@@ -1246,6 +1258,7 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
         pretrained_path=None,
         img_size=_img_size,
         use_FPN=False,
+        decoder_stride=_decoder_stride,
     )
 
     # Debug : comparer les cles attendues vs fournies

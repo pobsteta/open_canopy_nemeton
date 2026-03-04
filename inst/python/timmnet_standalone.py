@@ -232,6 +232,7 @@ class timmNet(nn.Module):
         lora_rank=0,
         use_FPN=False,
         chkpt_path=None,
+        decoder_stride=None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -300,6 +301,8 @@ class timmNet(nn.Module):
             self.remove_cls_token,
         ) = infer_output(self.model, self.num_channels, self.img_size)
 
+        # decoder_stride : si None, utiliser downsample_factor (1 seule couche)
+        _ds = decoder_stride if decoder_stride is not None else self.downsample_factor
         self.seg_head = segmentation_head(
             self.embed_dim,
             self.downsample_factor,
@@ -307,6 +310,7 @@ class timmNet(nn.Module):
             self.features_format,
             self.feature_size,
             self.num_classes,
+            decoder_stride=_ds,
         )
 
     def forward(self, x, metas=None):
