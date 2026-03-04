@@ -1332,6 +1332,18 @@ if _pad_H != _orig_H or _pad_W != _orig_W:
     tensor = padded
 
 with torch.no_grad():
+    # Debug : verifier les features du backbone
+    _features = model.model.forward_features(tensor)
+    if isinstance(_features, (list, tuple)):
+        _last_feat = _features[-1]
+        print(f"Backbone features: {len(_features)} niveaux, "
+              f"dernier={tuple(_last_feat.shape)}, "
+              f"min={_last_feat.min():.4f}, max={_last_feat.max():.4f}, "
+              f"mean={_last_feat.mean():.4f}")
+    else:
+        print(f"Backbone features: shape={tuple(_features.shape)}, "
+              f"min={_features.min():.4f}, max={_features.max():.4f}")
+
     output = model(tensor)
 
     # Le modele retourne {"out": tensor} (Open-Canopy) ou tensor (SMP)
@@ -1339,6 +1351,14 @@ with torch.no_grad():
         pred = output["out"]
     else:
         pred = output
+
+    # Debug : valeurs brutes avant clip
+    _raw = pred.squeeze().cpu().numpy()
+    print(f"Prediction brute: shape={_raw.shape}, "
+          f"min={_raw.min():.4f}, max={_raw.max():.4f}, "
+          f"mean={_raw.mean():.4f}, std={_raw.std():.4f}")
+    _neg_pct = (_raw < 0).sum() / _raw.size * 100
+    print(f"  Valeurs negatives: {_neg_pct:.1f}%")
 
     pred = pred.squeeze().cpu().numpy()
 
@@ -1348,7 +1368,7 @@ with torch.no_grad():
     elif pred.ndim == 3:
         pred = pred[:, :_orig_H, :_orig_W]
 
-    # Le modele predit en metres (targets = dm / 10)
+    # Le modele predit en metres (valeurs brutes)
     pred = np.clip(pred, 0, 50)
     pred = np.round(pred, 1)
 
