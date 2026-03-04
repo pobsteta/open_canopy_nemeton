@@ -1014,6 +1014,15 @@ keys = list(state_dict.keys())
 print(f"State dict: {len(keys)} parametres")
 print(f"  Premieres cles: {keys[:5]}")
 
+# Debug : chercher les cles seg_head dans le checkpoint
+_seg_keys = [k for k in keys if "seg_head" in k]
+print(f"  Cles seg_head dans checkpoint: {len(_seg_keys)}")
+if _seg_keys:
+    print(f"    Exemples: {_seg_keys[:5]}")
+else:
+    print("    AUCUNE cle seg_head trouvee dans le checkpoint!")
+    print(f"  Dernieres cles: {keys[-5:]}")
+
 # ======================================================================
 # Fonction set_first_layer (reproduction du code Open-Canopy)
 # Adapte la premiere couche conv de 3 a N canaux
