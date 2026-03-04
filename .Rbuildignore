@@ -1,0 +1,7 @@
+^\.Rproj\.user$
+^.*\.Rproj$
+^\.git$
+^\.gitignore$
+^data$
+^outputs$
+^LICENSE\.md$

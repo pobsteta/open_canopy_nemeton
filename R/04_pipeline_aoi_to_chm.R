@@ -17,7 +17,7 @@
 # Architecture Open-Canopy :
 #   - Modèle UNet (smp) avec encodeur ResNet34, 4 canaux → 1 sortie
 #   - Modèle PVTv2 (timm) avec pvt_v2_b3, 4 canaux → 1 sortie
-#   - Entrée : 4 bandes (R, G, B, NIR) sans normalisation (mean=0, std=1)
+#   - Entrée : 4 bandes (R, G, B, NIR), valeurs brutes (PAS de normalisation)
 #   - Sortie : hauteur de canopée en mètres (targets stockés en dm / 10)
 #   - Checkpoint : PyTorch Lightning, clés préfixées "net.seg_model."
 # ==============================================================================
@@ -70,8 +70,8 @@ RES_SPOT <- 1.5   # Modèles Open-Canopy (SPOT 6-7)
 HF_REPO_ID <- "AI4Forest/Open-Canopy"
 CONDA_ENV  <- "open_canopy"
 N_INPUT_CHANNELS <- 4  # R, G, B, NIR (ordre SPOT 6-7)
-# Chemin vers le code source Open-Canopy (nécessaire pour PVTv2)
-OPEN_CANOPY_SRC <- NULL  # Sera détecté automatiquement ou passé en paramètre
+# Chemin vers le code source Open-Canopy (optionnel pour PVTv2)
+OPEN_CANOPY_SRC <- NULL  # Auto-détecté, téléchargé, ou module embarqué
 
 # --- Limites WMS ---
 WMS_MAX_PX <- 4096  # Taille max par requête WMS
@@ -398,43 +398,211 @@ resample_to_spot <- function(ign_raster) {
 # ==============================================================================
 
 #' Configurer l'environnement Python
+#'
+#' Vérifie que les modules Python nécessaires sont disponibles.
+#' Note : huggingface_hub Python n'est plus requis si le package R hfhub
+#' est installé (méthode préférée pour le téléchargement des modèles).
 setup_python <- function() {
   library(reticulate)
 
-  # Vérifier les modules nécessaires
-  modules <- c("torch", "numpy", "rasterio", "huggingface_hub",
-               "segmentation_models_pytorch", "timm")
+  # Vérifier si Python est déjà configuré (ex: lancé depuis conda activate)
+  py_ok <- tryCatch(nzchar(py_config()$python), error = function(e) FALSE)
+
+  if (!py_ok) {
+    # Chercher l'env conda par nom (Miniforge, Miniconda, Anaconda)
+    conda_envs <- tryCatch(conda_list(), error = function(e) data.frame())
+    if (nrow(conda_envs) > 0) {
+      match_idx <- grep(CONDA_ENV, conda_envs$name, ignore.case = TRUE)
+      if (length(match_idx) > 0) {
+        use_python(conda_envs$python[match_idx[1]], required = TRUE)
+        message("  Env conda détecté: ", conda_envs$name[match_idx[1]])
+      }
+    }
+    # Fallback : CONDA_PREFIX
+    if (!tryCatch(nzchar(py_config()$python), error = function(e) FALSE)) {
+      conda_prefix <- Sys.getenv("CONDA_PREFIX", "")
+      if (nzchar(conda_prefix)) {
+        py_path <- if (.Platform$OS.type == "windows") {
+          file.path(conda_prefix, "python.exe")
+        } else {
+          file.path(conda_prefix, "bin", "python")
+        }
+        if (file.exists(py_path)) {
+          use_python(py_path, required = TRUE)
+          message("  Python (CONDA_PREFIX): ", conda_prefix)
+        }
+      }
+    }
+  }
+
+  # Modules Python essentiels (inférence)
+  modules_core <- c("torch", "numpy", "rasterio",
+                     "segmentation_models_pytorch", "timm")
+  # huggingface_hub Python est optionnel si hfhub R est disponible
+  has_hfhub_r <- requireNamespace("hfhub", quietly = TRUE)
+
   ok <- TRUE
-  for (mod in modules) {
+  for (mod in modules_core) {
     avail <- py_module_available(mod)
     message(sprintf("  Python %s: %s", mod, ifelse(avail, "OK", "MANQUANT")))
     if (!avail) ok <- FALSE
   }
 
-  if (!ok) {
-    stop("Modules Python manquants. Installez-les dans l'env '", CONDA_ENV, "':\n",
-         "  conda activate ", CONDA_ENV, "\n",
-         "  pip install torch torchvision numpy rasterio huggingface_hub ",
-         "segmentation-models-pytorch timm")
+  # Vérifier huggingface_hub Python seulement si hfhub R n'est pas dispo
+  if (has_hfhub_r) {
+    message("  hfhub (R natif): OK (téléchargement HF sans Python)")
+  } else {
+    hf_avail <- py_module_available("huggingface_hub")
+    message(sprintf("  Python huggingface_hub: %s",
+                     ifelse(hf_avail, "OK", "MANQUANT")))
+    if (!hf_avail) ok <- FALSE
   }
+
+  if (!ok) {
+    pip_cmd <- "  pip install torch torchvision numpy rasterio segmentation-models-pytorch timm"
+    if (!has_hfhub_r) {
+      pip_cmd <- paste0(pip_cmd, " huggingface_hub")
+    }
+    stop("Modules Python manquants. Installez-les dans l'env '", CONDA_ENV, "':\n",
+         "  conda activate ", CONDA_ENV, "\n", pip_cmd,
+         "\n\nOu installez le package R hfhub pour éviter la dépendance Python huggingface_hub :\n",
+         "  install.packages('hfhub')")
+  }
+}
+
+#' Trouver le nom du fichier checkpoint dans le dataset HF via l'API
+#'
+#' Interroge l'API Hugging Face pour découvrir les fichiers checkpoint
+#' disponibles dans le répertoire pretrained_models/ du dataset.
+#'
+#' @param repo_id Identifiant du dépôt HF (ex: "AI4Forest/Open-Canopy")
+#' @param model_name "unet" ou "pvtv2" pour filtrer
+#' @return Chemin du fichier checkpoint dans le dépôt, ou NULL
+find_checkpoint_name <- function(repo_id = HF_REPO_ID,
+                                  model_name = "pvtv2") {
+  url <- paste0("https://huggingface.co/api/datasets/", repo_id)
+  resp <- tryCatch(
+    httr2::request(url) |> httr2::req_perform(),
+    error = function(e) NULL
+  )
+  if (is.null(resp)) return(NULL)
+
+  info <- jsonlite::fromJSON(httr2::resp_body_string(resp))
+  files <- info$siblings$rfilename
+  ckpt_files <- files[grepl("^pretrained_models/.*\\.ckpt$", files)]
+  if (length(ckpt_files) == 0) return(NULL)
+
+  # Filtrer par nom de modèle
+  pattern <- switch(model_name,
+    unet  = "unet|smp",
+    pvtv2 = "pvt|pvtv2",
+    model_name
+  )
+  matches <- ckpt_files[grep(pattern, ckpt_files, ignore.case = TRUE)]
+  if (length(matches) > 0) return(matches[1])
+  return(ckpt_files[1])
+}
+
+#' Résoudre le chemin réel d'un fichier HuggingFace cache
+#'
+#' Sur Windows, le cache HF utilise des symlinks (snapshots/ → blobs/)
+#' qui ne fonctionnent pas sans le mode développeur. Cette fonction
+#' résout le chemin réel ou copie le fichier blob si nécessaire.
+#'
+#' @param path Chemin retourné par hub_download
+#' @return Chemin réel accessible
+#' @keywords internal
+.resolve_hf_path <- function(path) {
+  path <- as.character(path)
+
+  # Si le fichier est directement lisible, tout va bien
+  # suppressWarnings : sur Windows, file.size() sur un symlink HF
+  # génère un avertissement "Nom de répertoire non valide"
+  readable <- suppressWarnings(
+    file.exists(path) && !is.na(file.size(path)) && file.size(path) > 0
+  )
+  if (readable) {
+    return(normalizePath(path, winslash = "/"))
+  }
+
+  # Sur Windows : le symlink snapshots/xxx/file → blobs/yyy ne marche pas
+  # Chercher le fichier dans le dossier blobs/ du même repo
+  if (.Platform$OS.type == "windows" && grepl("snapshots", path)) {
+    repo_dir <- sub("/snapshots/.*$", "", path)
+    blobs_dir <- file.path(repo_dir, "blobs")
+
+    if (dir.exists(blobs_dir)) {
+      # Les blobs sont nommés par leur hash SHA256
+      # Chercher le plus gros fichier .ckpt-compatible (le checkpoint)
+      blobs <- list.files(blobs_dir, full.names = TRUE)
+      if (length(blobs) > 0) {
+        sizes <- suppressWarnings(file.size(blobs))
+        # Prendre le plus gros blob (le checkpoint est le plus volumineux)
+        best <- blobs[which.max(sizes)]
+        best_size <- suppressWarnings(file.size(best))
+        if (!is.na(best_size) && best_size > 1e6) {
+          message("  Windows: résolution symlink HF → ", best)
+          return(normalizePath(best, winslash = "/"))
+        }
+      }
+    }
+
+    # Alternative : lire le fichier symlink comme texte
+    # (HF crée parfois un fichier texte contenant le hash du blob)
+    path_size <- suppressWarnings(file.size(path))
+    if (file.exists(path) && !is.na(path_size) && path_size < 200) {
+      blob_hash <- trimws(readLines(path, n = 1, warn = FALSE))
+      blob_path <- file.path(repo_dir, "blobs", blob_hash)
+      blob_size <- suppressWarnings(file.size(blob_path))
+      if (file.exists(blob_path) && !is.na(blob_size) && blob_size > 1e6) {
+        message("  Windows: résolution hash HF → ", blob_path)
+        return(normalizePath(blob_path, winslash = "/"))
+      }
+    }
+
+    warning("Chemin HuggingFace inaccessible: ", path, "\n",
+            "  Activez le mode développeur Windows ou téléchargez le modèle manuellement.")
+  }
+
+  path
 }
 
 #' Télécharger le modèle pré-entraîné depuis Hugging Face
 #'
-#' Découvre dynamiquement les fichiers .ckpt dans pretrained_models/
-#' du dataset AI4Forest/Open-Canopy et télécharge celui correspondant
-#' au modèle demandé.
+#' Utilise le package R hfhub (natif, sans Python) pour télécharger
+#' le fichier checkpoint. Fallback sur Python huggingface_hub si hfhub
+#' n'est pas installé.
 #'
 #' @param model_name "unet" ou "pvtv2"
 #' @return Chemin local du modèle
-download_model <- function(model_name = "unet") {
+download_model <- function(model_name = "pvtv2") {
+  message("Téléchargement du modèle: ", model_name)
+  message("Depuis: ", HF_REPO_ID)
+
+  # --- Méthode 1 : hfhub R natif (préféré) ---
+  if (requireNamespace("hfhub", quietly = TRUE)) {
+    ckpt_name <- find_checkpoint_name(HF_REPO_ID, model_name)
+    if (!is.null(ckpt_name)) {
+      message("  Téléchargement via hfhub (R natif): ", ckpt_name)
+      tryCatch({
+        local_path <- hfhub::hub_download(HF_REPO_ID, ckpt_name,
+                                            repo_type = "dataset")
+        local_path <- .resolve_hf_path(local_path)
+        message("  Modèle téléchargé: ", local_path)
+        return(local_path)
+      }, error = function(e) {
+        message("  hfhub échoué: ", e$message, " \u2192 fallback Python")
+      })
+    }
+  }
+
+  # --- Méthode 2 : Python huggingface_hub (fallback) ---
   library(reticulate)
   hf_hub <- import("huggingface_hub")
 
   # Vérifier que le token HuggingFace est configuré (dataset gated)
   token <- Sys.getenv("HF_TOKEN", unset = "")
   if (token == "") {
-    # Vérifier si huggingface-cli login a été fait
     tryCatch({
       stored <- hf_hub$HfFolder$get_token()
       if (is.null(stored) || stored == "") stop("no token")
@@ -448,21 +616,15 @@ download_model <- function(model_name = "unet") {
     })
   }
 
-  message("Recherche des checkpoints dans le dataset HuggingFace...")
+  message("Recherche des checkpoints via Python huggingface_hub...")
 
-  # Lister dynamiquement les fichiers .ckpt dans pretrained_models/
   tryCatch({
     api <- hf_hub$HfApi()
 
-    # Utiliser list_repo_files (retourne des chaînes) — plus robuste que list_repo_tree
     all_files <- tryCatch({
-      files <- api$list_repo_files(
-        HF_REPO_ID,
-        repo_type = "dataset"
-      )
+      files <- api$list_repo_files(HF_REPO_ID, repo_type = "dataset")
       reticulate::iterate(files)
     }, error = function(e) {
-      # Fallback : list_repo_tree avec gestion des attributs
       tree <- api$list_repo_tree(
         HF_REPO_ID,
         path_in_repo = "pretrained_models",
@@ -479,7 +641,6 @@ download_model <- function(model_name = "unet") {
       paths
     })
 
-    # Filtrer les .ckpt dans pretrained_models/
     ckpt_files <- character(0)
     for (f in all_files) {
       fname <- as.character(f)
@@ -495,7 +656,6 @@ download_model <- function(model_name = "unet") {
     message("Checkpoints disponibles:")
     for (f in ckpt_files) message("  - ", f)
 
-    # Trouver le checkpoint correspondant au modèle demandé
     pattern <- switch(model_name,
       unet  = "unet|smp",
       pvtv2 = "pvt|pvtv2",
@@ -516,6 +676,7 @@ download_model <- function(model_name = "unet") {
       filename = paste0("pretrained_models/", target_file),
       repo_type = "dataset"
     )
+    local_path <- .resolve_hf_path(local_path)
     message("Modèle: ", local_path)
     return(local_path)
 
@@ -526,10 +687,111 @@ download_model <- function(model_name = "unet") {
     message("Alternatives :")
     message("  1. Définir votre token : Sys.setenv(HF_TOKEN = 'hf_...')")
     message("  2. Se connecter via CLI : huggingface-cli login")
-    message("  3. Fournir le chemin manuellement :")
+    message("  3. Installer hfhub R : install.packages('hfhub')")
+    message("  4. Fournir le chemin manuellement :")
     message('     result <- pipeline_aoi_to_chm("data/aoi.gpkg",')
     message('       model_path = "chemin/vers/checkpoint.ckpt")')
     stop("Échec du téléchargement du modèle.", call. = FALSE)
+  })
+}
+
+#' Télécharger le code source Open-Canopy
+#'
+#' Clone le dépôt GitHub Open-Canopy dans un dossier cache local.
+#' Réutilise le clone existant si déjà présent.
+#'
+#' @param dest Dossier de destination (NULL = cache utilisateur)
+#' @param force Forcer le re-téléchargement même si déjà présent
+#' @return Chemin vers le dossier Open-Canopy cloné, ou NULL en cas d'échec
+#' @export
+download_open_canopy_src <- function(dest = NULL, force = FALSE) {
+  repo_url <- "https://github.com/fajwel/Open-Canopy.git"
+
+  # Dossier cache par défaut
+  if (is.null(dest)) {
+    cache_dir <- tools::R_user_dir("opencanopy", "cache")
+    dest <- file.path(cache_dir, "Open-Canopy")
+  }
+
+  # Vérifier si déjà présent
+  if (dir.exists(file.path(dest, "src", "models")) && !force) {
+    message("Open-Canopy source déjà en cache: ", dest)
+    return(dest)
+  }
+
+  # Vérifier que git est disponible
+  git_ok <- tryCatch({
+    res <- system2("git", "--version", stdout = TRUE, stderr = TRUE)
+    length(res) > 0
+  }, error = function(e) FALSE)
+
+  if (!git_ok) {
+    message("git n'est pas disponible, téléchargement par archive ZIP")
+    return(.download_open_canopy_zip(dest))
+  }
+
+  # Clone superficiel (seulement le dernier commit)
+  message("Clonage d'Open-Canopy (shallow clone)...")
+  dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+
+  # Supprimer le dossier incomplet si force
+  if (force && dir.exists(dest)) {
+    unlink(dest, recursive = TRUE)
+  }
+
+  res <- tryCatch({
+    system2("git", c("clone", "--depth", "1", repo_url, dest),
+            stdout = TRUE, stderr = TRUE)
+  }, error = function(e) {
+    message("Erreur git clone: ", e$message)
+    return(NULL)
+  })
+
+  if (dir.exists(file.path(dest, "src", "models"))) {
+    message("Open-Canopy source téléchargé: ", dest)
+    return(dest)
+  }
+
+  message("Le clone git a échoué, tentative par archive ZIP...")
+  .download_open_canopy_zip(dest)
+}
+
+#' Télécharger Open-Canopy par archive ZIP (fallback sans git)
+#' @param dest Dossier de destination
+#' @return Chemin vers le dossier Open-Canopy, ou NULL en cas d'échec
+#' @keywords internal
+.download_open_canopy_zip <- function(dest) {
+  zip_url <- "https://github.com/fajwel/Open-Canopy/archive/refs/heads/main.zip"
+  tmp_zip <- tempfile(fileext = ".zip")
+
+  tryCatch({
+    dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+    message("Téléchargement de l'archive Open-Canopy...")
+    download.file(zip_url, tmp_zip, mode = "wb", quiet = TRUE)
+
+    # Extraire dans un dossier temporaire
+    tmp_dir <- tempfile("oc_extract_")
+    utils::unzip(tmp_zip, exdir = tmp_dir)
+    unlink(tmp_zip)
+
+    # GitHub nomme le dossier "Open-Canopy-main"
+    extracted <- list.dirs(tmp_dir, recursive = FALSE, full.names = TRUE)
+    if (length(extracted) == 1) {
+      if (dir.exists(dest)) unlink(dest, recursive = TRUE)
+      file.rename(extracted[1], dest)
+      unlink(tmp_dir, recursive = TRUE)
+    }
+
+    if (dir.exists(file.path(dest, "src", "models"))) {
+      message("Open-Canopy source téléchargé (ZIP): ", dest)
+      return(dest)
+    }
+
+    message("Extraction réussie mais structure inattendue dans: ", dest)
+    return(NULL)
+  }, error = function(e) {
+    message("Échec du téléchargement ZIP: ", e$message)
+    return(NULL)
   })
 }
 
@@ -570,14 +832,14 @@ make_inference_tiles <- function(r, tile_size = 1000, overlap = 50) {
 #'
 #' Supporte les deux architectures Open-Canopy :
 #' - UNet (SMP, ResNet34) : reconstruction directe via segmentation_models_pytorch
-#' - PVTv2 (timm, pvt_v2_b3) : nécessite le code source Open-Canopy
+#' - PVTv2 (timm, pvt_v2_b3) : module embarqué ou code source Open-Canopy
 #'
 #' @param tile SpatRaster (4 bandes : R, G, B, PIR à 1.5m)
 #' @param model_path Chemin du modèle .ckpt (PyTorch Lightning)
 #' @param model_name "unet" ou "pvtv2" pour la reconstruction
 #' @param open_canopy_src Chemin vers le code source Open-Canopy (pour PVTv2)
 #' @return SpatRaster CHM prédit (1 bande, en mètres)
-predict_tile <- function(tile, model_path, model_name = "unet",
+predict_tile <- function(tile, model_path, model_name = "pvtv2",
                           open_canopy_src = NULL) {
   library(reticulate)
 
@@ -586,6 +848,9 @@ predict_tile <- function(tile, model_path, model_name = "unet",
   tmp_in <- tempfile(tmpdir = tmp_dir, fileext = ".tif")
   tmp_out <- tempfile(tmpdir = tmp_dir, fileext = ".tif")
   writeRaster(tile, tmp_in, overwrite = TRUE)
+
+  # Résoudre le chemin modèle (symlinks HF sur Windows)
+  model_path <- .resolve_hf_path(model_path)
 
   # Normaliser les chemins pour Python sous Windows
   tmp_in_py <- gsub("\\\\", "/", tmp_in)
@@ -616,7 +881,7 @@ with rasterio.open("__INPUT_PATH__") as src:
 num_bands, H, W = image.shape
 print(f"Image chargee: {num_bands} bandes, {H}x{W} px")
 
-# Open-Canopy utilise mean=0, std=1 : pas de normalisation
+# Tensor brut - le modele Open-Canopy attend les valeurs brutes (pas de normalisation)
 tensor = torch.from_numpy(image).unsqueeze(0)  # (1, C, H, W)
 print(f"Tensor: shape={tuple(tensor.shape)}, "
       f"min={tensor.min():.1f}, max={tensor.max():.1f}")
@@ -626,6 +891,7 @@ print(f"Tensor: shape={tuple(tensor.shape)}, "
 # ======================================================================
 ckpt_path = "__MODEL_PATH__"
 oc_src = "__OC_SRC__"
+embedded_py = "__EMBEDDED_PY__"
 
 # Ajouter Open-Canopy au path avant chargement (le checkpoint peut
 # referencer des classes du module src)
@@ -633,6 +899,12 @@ if oc_src and os.path.isdir(oc_src):
     if oc_src not in sys.path:
         sys.path.insert(0, oc_src)
         print(f"Open-Canopy source ajoute au path: {oc_src}")
+
+# Ajouter le module embarque au path (pour PVTv2 sans repo externe)
+if embedded_py and os.path.isdir(embedded_py):
+    if embedded_py not in sys.path:
+        sys.path.insert(0, embedded_py)
+        print(f"Module timmNet embarque disponible: {embedded_py}")
 
 import types as _types
 
@@ -682,10 +954,40 @@ except (ModuleNotFoundError, ImportError) as e:
 
 print(f"Checkpoint cles: {list(checkpoint.keys())}")
 
+# ======================================================================
+# Extraire mean/std du checkpoint (informatif uniquement)
+# ======================================================================
+# IMPORTANT: Le code source Open-Canopy (canopy_datamodule.py) cree les
+# datasets avec mean=0, std=1 (aucune normalisation). Les mean/std stockes
+# dans datamodule_hyper_parameters sont des parametres du constructeur
+# sauvegardes par save_hyperparameters() mais JAMAIS utilises dans le
+# pipeline de donnees. Le modele a ete entraine sur les valeurs brutes
+# des pixels. Ne PAS appliquer de normalisation !
+# ======================================================================
+dm_hparams = checkpoint.get("datamodule_hyper_parameters", {})
+model_hparams = checkpoint.get("hyper_parameters", {})
+
+_nc = model_hparams.get("num_channels", "?")
+_mn = dm_hparams.get("mean", "?")
+_sd = dm_hparams.get("std", "?")
+print(f"Model hparams: num_channels={_nc}")
+print(f"Datamodule hparams mean={_mn}, std={_sd} (NON utilises a l entrainement)")
+print(f"  -> Pas de normalisation (le modele attend les valeurs brutes des pixels)")
+print(f"  Tensor brut: min={tensor.min():.3f}, max={tensor.max():.3f}")
+
 state_dict = checkpoint.get("state_dict", checkpoint)
 keys = list(state_dict.keys())
 print(f"State dict: {len(keys)} parametres")
 print(f"  Premieres cles: {keys[:5]}")
+
+# Debug : chercher les cles seg_head dans le checkpoint
+_seg_keys = [k for k in keys if "seg_head" in k]
+print(f"  Cles seg_head dans checkpoint: {len(_seg_keys)}")
+if _seg_keys:
+    print(f"    Exemples: {_seg_keys[:5]}")
+else:
+    print("    AUCUNE cle seg_head trouvee dans le checkpoint!")
+    print(f"  Dernieres cles: {keys[-5:]}")
 
 # ======================================================================
 # Fonction set_first_layer (reproduction du code Open-Canopy)
@@ -732,6 +1034,87 @@ def clean_state_dict(state_dict, prefix_to_strip):
                 break
         clean[new_k] = v
     return clean
+
+def smart_load_state_dict(model, ckpt_state_dict, prefixes_to_strip):
+    """Charge le state_dict en adaptant automatiquement les cles.
+
+    Gere les differences de nommage entre versions de timm :
+    - features_only=True peut renommer stages.0 en stages_0
+    - Prefixes variables (net., model., net.model.)
+    """
+    import re
+
+    # Etape 1 : essayer les prefixes dans l ordre
+    best_missing = None
+    best_dict = None
+    best_prefix = None
+
+    # Combinaisons de prefixes a essayer
+    prefix_combos = [
+        prefixes_to_strip,          # ["net.", "model."] -> strip "net." only
+        ["net.model."],             # strip "net.model." together
+        ["net."],                   # strip "net." only
+        [],                         # no stripping
+    ]
+
+    for combo in prefix_combos:
+        d = clean_state_dict(ckpt_state_dict, combo) if combo else dict(ckpt_state_dict)
+        missing, unexpected = model.load_state_dict(d, strict=False)
+        if best_missing is None or len(missing) < len(best_missing):
+            best_missing = missing
+            best_dict = d
+            best_prefix = combo
+        if len(missing) == 0:
+            print(f"  Prefixe parfait: {combo}")
+            return missing, unexpected
+
+    # Etape 2 : construire mapping si beaucoup de cles manquent
+    model_keys = set(model.state_dict().keys())
+    ckpt_keys = set(best_dict.keys())
+
+    if len(best_missing) > len(model_keys) * 0.1:
+        print(f"  Mapping automatique ({len(best_missing)} cles manquantes sur {len(model_keys)})")
+
+        def normalize_key(k):
+            """stages_0.blocks_1 -> stages.0.blocks.1"""
+            return re.sub(r"_(\\d+)", r".\\1", k)
+
+        # Construire un index inverse : cle normalisee -> cle checkpoint
+        ckpt_norm = {normalize_key(k): k for k in ckpt_keys}
+
+        # Combiner matches directs ET normalises
+        combined = {}
+        matched_direct = 0
+        matched_norm = 0
+
+        for model_k in model_keys:
+            # 1. Match direct : la cle existe telle quelle dans best_dict
+            if model_k in best_dict:
+                combined[model_k] = best_dict[model_k]
+                matched_direct += 1
+            else:
+                # 2. Match normalise : stages_0 -> stages.0
+                norm_k = normalize_key(model_k)
+                if norm_k in ckpt_norm:
+                    ckpt_k = ckpt_norm[norm_k]
+                    combined[model_k] = best_dict[ckpt_k]
+                    matched_norm += 1
+
+        total = matched_direct + matched_norm
+        print(f"  {total}/{len(model_keys)} cles trouvees ({matched_direct} directes, {matched_norm} normalisees)")
+
+        if total > len(best_missing) * 0.5:
+            missing, unexpected = model.load_state_dict(combined, strict=False)
+            print(f"  Apres chargement: {len(missing)} manquantes, {len(unexpected)} inattendues")
+            if 0 < len(missing) <= 10:
+                for m in missing:
+                    print(f"    - {m}")
+            return missing, unexpected
+
+    # Etape 3 : utiliser le meilleur resultat
+    print(f"  Meilleur prefixe: {best_prefix}, {len(best_missing)} manquantes")
+    model.load_state_dict(best_dict, strict=False)
+    return best_missing, []
 
 # ======================================================================
 # Reconstruire le modele selon l architecture
@@ -787,86 +1170,176 @@ if has_seg_model or (model_name == "unet" and not has_timm_model):
 elif has_timm_model or has_seg_head or model_name == "pvtv2":
     print("=== Reconstruction: PVTv2 (timm pvt_v2_b3, 4ch, 1 classe) ===")
 
-    if oc_src and os.path.isdir(oc_src):
+    _timmNet = None
+    _import_errors = []
+
+    # Strategie 1 : module embarque (aucune dependance externe)
+    try:
+        from timmnet_standalone import timmNet as _timmNet
+        print("Import timmNet depuis module embarque (standalone)")
+    except Exception as e:
+        _import_errors.append(f"Module embarque: {e}")
+        print(f"Import module embarque echoue: {e}")
+
+    # Strategie 2 : code source Open-Canopy (si fourni)
+    if _timmNet is None and oc_src and os.path.isdir(oc_src):
         try:
-            from src.models.components.timmNet import timmNet
-            print("Import timmNet depuis Open-Canopy reussi")
-
-            # Reconstruire le modele PVTv2 avec les memes parametres
-            # que configs/model/PVTv2_B.yaml + _seg_default.yaml
-            pvt_model = timmNet(
-                backbone="pvt_v2_b3.in1k",
-                num_classes=1,
-                num_channels=num_bands,
-                pretrained=False,       # pas besoin, on charge le checkpoint
-                pretrained_path=None,
-                img_size=max(H, W),     # taille de l image d entree
-                use_FPN=False,
-            )
-
-            # Cles Lightning : "net.model.xxx" et "net.seg_head.xxx"
-            clean_dict = clean_state_dict(state_dict, ["net.", "model."])
-
-            missing, unexpected = pvt_model.load_state_dict(
-                clean_dict, strict=False)
-            if missing:
-                print(f"  Cles manquantes: {len(missing)}")
-                for m in missing[:3]:
-                    print(f"    - {m}")
-            if unexpected:
-                print(f"  Cles inattendues: {len(unexpected)}")
-
-            pvt_model.eval()
-            model = pvt_model
-            print("PVTv2 charge avec succes")
-
-        except ImportError as e:
-            print(f"Erreur import Open-Canopy: {e}")
-            print("Verifiez que le code source est complet.")
+            from src.models.components.timmNet import timmNet as _timmNet
+            print("Import timmNet depuis Open-Canopy source")
         except Exception as e:
-            print(f"Erreur reconstruction PVTv2: {e}")
-            import traceback
-            traceback.print_exc()
+            _import_errors.append(f"Open-Canopy source: {e}")
+            print(f"Import Open-Canopy echoue: {e}")
+
+    if _timmNet is None:
+        msg = "Impossible de charger timmNet pour PVTv2.\\n"
+        msg += f"  Module embarque: {embedded_py!r}\\n"
+        msg += f"  Open-Canopy src: {oc_src!r}\\n"
+        for err in _import_errors:
+            msg += f"  - {err}\\n"
+        msg += "  Verifiez que timm est installe: pip install timm"
+        raise RuntimeError(msg)
+
+    # Detecter decoder_stride depuis les cles seg_head du checkpoint
+    # 2 cles (layers.0.weight/bias) = stride unique = downsample_factor
+    # 50+ cles (layers.0.0.weight...) = stride=2 avec couches intermediaires
+    _seg_ckpt_keys = [k for k in keys if "seg_head" in k]
+    _has_nested = any(".layers.0.0." in k for k in _seg_ckpt_keys)
+    if _has_nested:
+        _decoder_stride = 2
     else:
-        print("ERREUR: Le modele PVTv2 necessite le code source Open-Canopy.")
-        print(f"  Chemin fourni: {oc_src!r}")
-        print("  Utilisez le parametre open_canopy_src dans pipeline_aoi_to_chm()")
-        print("  Exemple:")
-        print(\'    pipeline_aoi_to_chm("aoi.gpkg", model_name="pvtv2",\')
-        print(\'      open_canopy_src="C:/Users/.../Open-Canopy")\')
+        _decoder_stride = None  # sera = downsample_factor (1 seule couche)
+    _ds_label = _decoder_stride if _decoder_stride else "auto(=downsample_factor)"
+    print(f"  Seg head checkpoint: {len(_seg_ckpt_keys)} cles, "
+          f"nested={_has_nested}, decoder_stride={_ds_label}")
+
+    # PVTv2 reduit par facteur 32 : img_size doit etre multiple de 32
+    _pad_multiple = 32
+    _img_size = ((max(H, W) + _pad_multiple - 1) // _pad_multiple) * _pad_multiple
+    print(f"  img_size ajuste: {max(H, W)} -> {_img_size} (multiple de {_pad_multiple})")
+
+    # Creer le modele (compatible ancien et nouveau timmnet_standalone)
+    try:
+        pvt_model = _timmNet(
+            backbone="pvt_v2_b3.in1k",
+            num_classes=1,
+            num_channels=num_bands,
+            pretrained=False,
+            pretrained_path=None,
+            img_size=_img_size,
+            use_FPN=False,
+            decoder_stride=_decoder_stride,
+        )
+    except TypeError:
+        # Ancienne version sans decoder_stride - on le remplace apres
+        pvt_model = _timmNet(
+            backbone="pvt_v2_b3.in1k",
+            num_classes=1,
+            num_channels=num_bands,
+            pretrained=False,
+            pretrained_path=None,
+            img_size=_img_size,
+            use_FPN=False,
+        )
+
+    # Si le checkpoint a un seg_head simple (2 cles) mais le modele en a plus,
+    # reconstruire le seg_head avec le bon decoder_stride
+    _model_seg_keys = [k for k in pvt_model.state_dict().keys() if "seg_head" in k]
+    if len(_seg_ckpt_keys) > 0 and len(_model_seg_keys) != len(_seg_ckpt_keys):
+        _dsf = pvt_model.downsample_factor
+        _dsf = _dsf[-1] if isinstance(_dsf, (list, tuple)) else _dsf
+        _ds = _dsf if not _has_nested else 2
+        print(f"  Reconstruction seg_head: {len(_model_seg_keys)} -> {len(_seg_ckpt_keys)} cles (decoder_stride={_ds})")
+        from timmnet_standalone import SimpleSegmentationHead
+        pvt_model.seg_head = SimpleSegmentationHead(
+            pvt_model.embed_dim,
+            pvt_model.downsample_factor,
+            pvt_model.remove_cls_token,
+            pvt_model.features_format,
+            pvt_model.feature_size,
+            pvt_model.num_classes,
+            decoder_stride=_ds,
+        )
+
+    # Debug : comparer les cles attendues vs fournies
+    model_sample = list(pvt_model.state_dict().keys())[:5]
+    ckpt_sample = list(state_dict.keys())[:5]
+    print(f"  Cles modele (exemples): {model_sample}")
+    print(f"  Cles checkpoint (exemples): {ckpt_sample}")
+
+    missing, unexpected = smart_load_state_dict(
+        pvt_model, state_dict, ["net.", "model."])
+    if missing:
+        print(f"  Cles manquantes finales: {len(missing)}")
+        for m in missing[:5]:
+            print(f"    - {m}")
+    if unexpected:
+        print(f"  Cles inattendues finales: {len(unexpected)}")
+
+    pvt_model.eval()
+    model = pvt_model
+    print("PVTv2 charge avec succes")
 
 # ======================================================================
 # Inference
 # ======================================================================
+if model is None:
+    raise RuntimeError("Le modele na pas pu etre charge. Verifiez les logs ci-dessus.")
+
+# Padding a un multiple de 32 pour PVTv2 (ou autre modele par reduction)
+_pad = 32
+_orig_H, _orig_W = H, W
+_pad_H = ((_orig_H + _pad - 1) // _pad) * _pad
+_pad_W = ((_orig_W + _pad - 1) // _pad) * _pad
+
+if _pad_H != _orig_H or _pad_W != _orig_W:
+    print(f"Padding: {_orig_H}x{_orig_W} -> {_pad_H}x{_pad_W}")
+    padded = torch.zeros(1, num_bands, _pad_H, _pad_W, dtype=tensor.dtype)
+    padded[:, :, :_orig_H, :_orig_W] = tensor
+    tensor = padded
+
 with torch.no_grad():
-    if model is not None:
-        output = model(tensor)
-
-        # Le modele retourne {"out": tensor} (Open-Canopy) ou tensor (SMP)
-        if isinstance(output, dict):
-            pred = output["out"]
-        else:
-            pred = output
-
-        pred = pred.squeeze().cpu().numpy()
-
-        # Le modele predit en metres (targets = dm / 10)
-        pred = np.clip(pred, 0, 50)
-        pred = np.round(pred, 1)
-
-        print(f"CHM predit: min={pred.min():.1f}m, max={pred.max():.1f}m, "
-              f"mean={pred.mean():.1f}m")
+    # Debug : verifier les features du backbone
+    _features = model.model.forward_features(tensor)
+    if isinstance(_features, (list, tuple)):
+        _last_feat = _features[-1]
+        print(f"Backbone features: {len(_features)} niveaux, "
+              f"dernier={tuple(_last_feat.shape)}, "
+              f"min={_last_feat.min():.4f}, max={_last_feat.max():.4f}, "
+              f"mean={_last_feat.mean():.4f}")
     else:
-        print("ATTENTION: Modele non charge, fallback estimation NDVI-based")
-        img = tensor.squeeze().numpy()
-        if num_bands >= 4:
-            pir = img[3]
-            rouge = img[0]
-            ndvi = (pir - rouge) / (pir + rouge + 1e-6)
-            pred = np.clip(ndvi * 25, 0, 40)
-        else:
-            greenness = img[1] / (img.mean(axis=0) + 1e-6)
-            pred = np.clip(greenness * 20, 0, 40)
+        print(f"Backbone features: shape={tuple(_features.shape)}, "
+              f"min={_features.min():.4f}, max={_features.max():.4f}")
+
+    output = model(tensor)
+
+    # Le modele retourne {"out": tensor} (Open-Canopy) ou tensor (SMP)
+    if isinstance(output, dict):
+        pred = output["out"]
+    else:
+        pred = output
+
+    # Debug : valeurs brutes avant clip
+    _raw = pred.squeeze().cpu().numpy()
+    print(f"Prediction brute: shape={_raw.shape}, "
+          f"min={_raw.min():.4f}, max={_raw.max():.4f}, "
+          f"mean={_raw.mean():.4f}, std={_raw.std():.4f}")
+    _neg_pct = (_raw < 0).sum() / _raw.size * 100
+    print(f"  Valeurs negatives: {_neg_pct:.1f}%")
+
+    pred = pred.squeeze().cpu().numpy()
+
+    # Recadrer au dimensions originales (enlever le padding)
+    if pred.ndim == 2:
+        pred = pred[:_orig_H, :_orig_W]
+    elif pred.ndim == 3:
+        pred = pred[:, :_orig_H, :_orig_W]
+
+    # Le modele predit en metres (conforme a regression_module.py)
+    pred = np.clip(pred, 0, 500)
+    pred = np.round(pred, 1)
+
+    print(f"CHM predit: min={pred.min():.1f}m, max={pred.max():.1f}m, "
+          f"mean={pred.mean():.1f}m")
 
 # ======================================================================
 # Sauvegarder le resultat
@@ -877,11 +1350,31 @@ with rasterio.open("__OUTPUT_PATH__", "w", **profile) as dst:
 
 print("Prediction sauvegardee")
 '
+  # Chemin vers le module Python embarqué (timmnet_standalone)
+  embedded_py_dir <- system.file("python", package = "opencanopy")
+  if (!nzchar(embedded_py_dir)) {
+    # Fallback: package non installé, utiliser le chemin source
+    embedded_py_dir <- file.path(
+      system.file(package = "opencanopy"),
+      "python"
+    )
+    if (!dir.exists(embedded_py_dir)) {
+      # Dernier recours : chemin relatif depuis le code source
+      pkg_root <- tryCatch(
+        rprojroot::find_package_root_file(),
+        error = function(e) getwd()
+      )
+      embedded_py_dir <- file.path(pkg_root, "inst", "python")
+    }
+  }
+  embedded_py_py <- gsub("\\\\", "/", embedded_py_dir)
+
   # Substitution des placeholders (evite sprintf et ses limites)
   py_code <- gsub("__INPUT_PATH__", tmp_in_py, py_code, fixed = TRUE)
   py_code <- gsub("__MODEL_PATH__", model_path_py, py_code, fixed = TRUE)
   py_code <- gsub("__MODEL_NAME__", model_name, py_code, fixed = TRUE)
   py_code <- gsub("__OC_SRC__", oc_src_py, py_code, fixed = TRUE)
+  py_code <- gsub("__EMBEDDED_PY__", embedded_py_py, py_code, fixed = TRUE)
   py_code <- gsub("__OUTPUT_PATH__", tmp_out_py, py_code, fixed = TRUE)
 
   tryCatch({
@@ -893,17 +1386,7 @@ print("Prediction sauvegardee")
     rm(pred_disk)
     return(pred)
   }, error = function(e) {
-    warning("Erreur inférence: ", e$message)
-    message("  Utilisation d'une estimation NDVI alternative...")
-    if (nlyr(tile) >= 4) {
-      pir <- tile[[4]]
-      rouge <- tile[[1]]
-      ndvi <- (pir - rouge) / (pir + rouge + 0.001)
-      pred <- clamp(ndvi * 25, lower = 0, upper = 40)
-      names(pred) <- "chm_estimated"
-      return(pred)
-    }
-    return(NULL)
+    stop("Erreur inférence du modèle: ", e$message, call. = FALSE)
   }, finally = {
     unlink(c(tmp_in, tmp_out))
   })
@@ -948,7 +1431,7 @@ combine_rvb_irc <- function(rvb, irc) {
 #' @param model_name "unet" ou "pvtv2"
 #' @param tile_size Taille des tuiles en mètres
 #' @return SpatRaster CHM prédit
-run_inference <- function(rvb, irc, model_path, model_name = "unet",
+run_inference <- function(rvb, irc, model_path, model_name = "pvtv2",
                            tile_size = 1000, open_canopy_src = NULL) {
   message("\n=== Inférence Open-Canopy ===")
 
@@ -999,15 +1482,15 @@ run_inference <- function(rvb, irc, model_path, model_name = "unet",
 #' @param model_name "unet" ou "pvtv2"
 #' @param model_path Chemin local vers un checkpoint .ckpt (optionnel,
 #'   sinon téléchargé depuis HuggingFace)
-#' @param open_canopy_src Chemin vers le code source Open-Canopy (nécessaire
-#'   pour PVTv2, auto-détecté sinon)
+#' @param open_canopy_src Chemin vers le code source Open-Canopy (optionnel,
+#'   le module embarqué timmnet_standalone est utilisé par défaut)
 #' @param res_m Résolution de téléchargement IGN (0.2m par défaut)
 #' @param millesime_ortho Millésime ortho RVB (NULL = plus récent)
 #' @param millesime_irc Millésime IRC (NULL = plus récent)
 #' @return Liste avec tous les résultats
 pipeline_aoi_to_chm <- function(aoi_path,
                                   output_dir = file.path(getwd(), "outputs"),
-                                  model_name = "unet",
+                                  model_name = "pvtv2",
                                   model_path = NULL,
                                   open_canopy_src = NULL,
                                   res_m = RES_IGN,
@@ -1052,14 +1535,15 @@ pipeline_aoi_to_chm <- function(aoi_path,
   # --- Étape 4 : Inférence ---
   message("\n>>> ÉTAPE 4/5 : Inférence du modèle ", model_name)
 
-  # Auto-détecter le code source Open-Canopy si nécessaire (pour PVTv2)
+  # Auto-détecter ou télécharger le code source Open-Canopy (pour PVTv2)
   if (is.null(open_canopy_src) && model_name == "pvtv2") {
-    # Chercher dans les emplacements courants
+    # 1. Chercher dans les emplacements courants
     candidates <- c(
       file.path(getwd(), "Open-Canopy"),
       file.path(dirname(getwd()), "Open-Canopy"),
       file.path(Sys.getenv("USERPROFILE"), "dev", "Open-Canopy"),
-      file.path(Sys.getenv("HOME"), "dev", "Open-Canopy")
+      file.path(Sys.getenv("HOME"), "dev", "Open-Canopy"),
+      file.path(tools::R_user_dir("opencanopy", "cache"), "Open-Canopy")
     )
     for (cand in candidates) {
       if (dir.exists(file.path(cand, "src", "models"))) {
@@ -1068,10 +1552,10 @@ pipeline_aoi_to_chm <- function(aoi_path,
         break
       }
     }
+    # 2. Sinon, télécharger automatiquement
     if (is.null(open_canopy_src)) {
-      stop("Le modèle PVTv2 nécessite le code source Open-Canopy.\n",
-           "Clonez le dépôt: git clone https://github.com/fajwel/Open-Canopy\n",
-           "Puis passez le chemin: open_canopy_src = 'chemin/vers/Open-Canopy'")
+      message("Open-Canopy source non trouvé localement, téléchargement...")
+      open_canopy_src <- download_open_canopy_src()
     }
   }
 
@@ -1154,9 +1638,25 @@ pipeline_aoi_to_chm <- function(aoi_path,
     library(patchwork)
     library(tidyterra)
 
+    # Sous-échantillonnage pour affichage interactif (max ~800x800 px)
+    max_dim <- 800
+    agg_factor <- max(1, ceiling(max(nrow(chm), ncol(chm)) / max_dim))
+    if (agg_factor > 1) {
+      message("Sous-échantillonnage x", agg_factor, " pour affichage RStudio")
+      rvb_disp  <- aggregate(ortho$rvb, fact = agg_factor, fun = "mean")
+      irc_disp  <- aggregate(ortho$irc, fact = agg_factor, fun = "mean")
+      ndvi_disp <- aggregate(ndvi,      fact = agg_factor, fun = "mean")
+      chm_disp  <- aggregate(chm,       fact = agg_factor, fun = "mean")
+    } else {
+      rvb_disp  <- ortho$rvb
+      irc_disp  <- ortho$irc
+      ndvi_disp <- ndvi
+      chm_disp  <- chm
+    }
+
     # Panel 1 : Ortho RVB
     p_rvb <- ggplot() +
-      geom_spatraster_rgb(data = ortho$rvb, r = 1, g = 2, b = 3,
+      geom_spatraster_rgb(data = rvb_disp, r = 1, g = 2, b = 3,
                           max_col_value = 255) +
       labs(title = sprintf("Ortho RVB 0.20m (%s)", label_ortho)) +
       theme_minimal() +
@@ -1167,7 +1667,7 @@ pipeline_aoi_to_chm <- function(aoi_path,
 
     # Panel 2 : Ortho IRC fausses couleurs
     p_irc <- ggplot() +
-      geom_spatraster_rgb(data = ortho$irc, r = 1, g = 2, b = 3,
+      geom_spatraster_rgb(data = irc_disp, r = 1, g = 2, b = 3,
                           max_col_value = 255) +
       labs(title = sprintf("Ortho IRC 0.20m (%s)", label_irc)) +
       theme_minimal() +
@@ -1178,7 +1678,7 @@ pipeline_aoi_to_chm <- function(aoi_path,
 
     # Panel 3 : NDVI
     p_ndvi <- ggplot() +
-      geom_spatraster(data = ndvi) +
+      geom_spatraster(data = ndvi_disp) +
       scale_fill_gradientn(
         colours = c("#d73027", "#fc8d59", "#fee08b", "#ffffbf",
                     "#d9ef8b", "#91cf60", "#1a9850", "#006837"),
@@ -1194,7 +1694,7 @@ pipeline_aoi_to_chm <- function(aoi_path,
 
     # Panel 4 : CHM
     p_chm <- ggplot() +
-      geom_spatraster(data = chm) +
+      geom_spatraster(data = chm_disp) +
       scale_fill_gradientn(
         colours = c("#f7fcb9", "#addd8e", "#41ab5d", "#006837", "#004529"),
         na.value = "transparent",

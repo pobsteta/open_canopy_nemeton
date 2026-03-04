@@ -1,0 +1,36 @@
+Package: opencanopy
+Title: Open-Canopy - Canopy Height Estimation from IGN Ortho + SPOT Models
+Version: 0.1.0
+Authors@R:
+    person("Pascal", "Obstetar", , "pascal.obstetar@gmail.com", role = c("aut", "cre"))
+Description: Interface R pour le dataset Open-Canopy de AI4Forest. Open-Canopy
+    fournit des modèles (UNet, PVTv2) entraînés sur images SPOT 6-7 à 1.5m pour
+    prédire la hauteur de canopée. Ce package adapte ces modèles pour fonctionner
+    avec les orthophotos IGN (BD ORTHO®) à 0.20m, qui offrent une résolution 7.5x
+    supérieure. Il permet de télécharger les données depuis Hugging Face
+    (AI4Forest/Open-Canopy), de rééchantillonner les ortho IGN, d'exécuter les
+    modèles pré-entraînés (UNet/SMP, PVTv2/timm) pour l'estimation de hauteur
+    de canopée, et de produire des cartes CHM géoréférencées.
+License: file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports:
+    terra,
+    sf,
+    httr2,
+    jsonlite,
+    curl,
+    fs,
+    reticulate
+Suggests:
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown,
+    ggplot2,
+    tidyterra,
+    patchwork,
+    hfhub
+VignetteBuilder: knitr
+URL: https://github.com/pobsteta/open_canopy_nemeton
+BugReports: https://github.com/pobsteta/open_canopy_nemeton/issues
