@@ -1080,13 +1080,18 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
         msg += "  Verifiez que timm est installe: pip install timm"
         raise RuntimeError(msg)
 
+    # PVTv2 reduit par facteur 32 : img_size doit etre multiple de 32
+    _pad_multiple = 32
+    _img_size = ((max(H, W) + _pad_multiple - 1) // _pad_multiple) * _pad_multiple
+    print(f"  img_size ajuste: {max(H, W)} -> {_img_size} (multiple de {_pad_multiple})")
+
     pvt_model = _timmNet(
         backbone="pvt_v2_b3.in1k",
         num_classes=1,
         num_channels=num_bands,
         pretrained=False,
         pretrained_path=None,
-        img_size=max(H, W),
+        img_size=_img_size,
         use_FPN=False,
     )
 
@@ -1111,6 +1116,18 @@ elif has_timm_model or has_seg_head or model_name == "pvtv2":
 if model is None:
     raise RuntimeError("Le modele na pas pu etre charge. Verifiez les logs ci-dessus.")
 
+# Padding a un multiple de 32 pour PVTv2 (ou autre modele par reduction)
+_pad = 32
+_orig_H, _orig_W = H, W
+_pad_H = ((_orig_H + _pad - 1) // _pad) * _pad
+_pad_W = ((_orig_W + _pad - 1) // _pad) * _pad
+
+if _pad_H != _orig_H or _pad_W != _orig_W:
+    print(f"Padding: {_orig_H}x{_orig_W} -> {_pad_H}x{_pad_W}")
+    padded = torch.zeros(1, num_bands, _pad_H, _pad_W, dtype=tensor.dtype)
+    padded[:, :, :_orig_H, :_orig_W] = tensor
+    tensor = padded
+
 with torch.no_grad():
     output = model(tensor)
 
@@ -1121,6 +1138,12 @@ with torch.no_grad():
         pred = output
 
     pred = pred.squeeze().cpu().numpy()
+
+    # Recadrer au dimensions originales (enlever le padding)
+    if pred.ndim == 2:
+        pred = pred[:_orig_H, :_orig_W]
+    elif pred.ndim == 3:
+        pred = pred[:, :_orig_H, :_orig_W]
 
     # Le modele predit en metres (targets = dm / 10)
     pred = np.clip(pred, 0, 50)
